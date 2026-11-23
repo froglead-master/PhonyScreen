@@ -17,6 +17,8 @@ Formerly named PhonePane (old repo froglead-master/PhonePane, renamed 2026-11-23
 - `phonyscreen/viewer.py`: everything else. `LeanMirror` (subclass of pymobiledevice3's `VncStreamServer`) runs the stream on an asyncio thread; `main()` is the pygame window loop (rounded window via SetWindowRgn, pill bar, keypad, settings panel, gestures, locked view)
 - `phonyscreen/audio.py`: AAC-ELD decode (PyAV) + jitter buffer + sounddevice output
 - `phonyscreen/winclip.py`: Win32 clipboard (text)
+- `phonyscreen/style.py`: look of the window: palette, Segoe UI fonts loaded from their files (`SysFont("segoeui")` picks Segoe UI *Light*), antialiased shapes/icons (white mask drawn 4x, smoothscaled, tinted; cached). `viewer.py` builds each overlay once per state (`cached_overlay`)
+- `phonyscreen/appicon.py`: the app icon ("Mirror": iPhone + its mirrored copy on a flat squircle tile, no background gradient by the owner's choice), drawn with Pillow; ≤32 px get a simplified drawing. Single source for the window/taskbar icon, the connecting screen and `assets/phonyscreen.ico` (regenerate: `python -m phonyscreen.appicon assets/phonyscreen.ico`)
 - `phonyscreen/phoneclip.py`: text from rich phone copies (HTML / web archive → text), patched into pymobiledevice3's `snapshot_text`
 - `phonyscreen/discovery.py`: finds the phone on Wi-Fi by scanning the /24 for port 62078 and checking the UDID
 - `phonyscreen/config.py`: `%APPDATA%\PhonyScreen\config.json` (udid, wifi_ip, window_pos, settings)

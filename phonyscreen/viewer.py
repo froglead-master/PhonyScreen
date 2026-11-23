@@ -26,13 +26,13 @@ import argparse
 import asyncio
 import contextlib
 import logging
-import math
 import os
 import queue
 import sys
 import threading
 import time
 from collections import deque
+from functools import lru_cache
 from typing import Any, Callable, Optional
 
 import av
@@ -44,7 +44,7 @@ from pymobiledevice3.remote.core_device.hid_service import TouchscreenContact
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
 from pymobiledevice3.tunneld.api import get_tunneld_devices
 
-from phonyscreen import phoneclip
+from phonyscreen import appicon, phoneclip, style
 
 logger = logging.getLogger("phonyscreen.viewer")
 
@@ -197,7 +197,7 @@ class LeanMirror(vs.VncStreamServer):
         self.slot: Optional[tuple[bytes, int, int, int, int, float, int]] = None
         self.slot_lock = threading.Lock()
         self.newframe_pending = threading.Event()
-        self.status = "starting video..."
+        self.status = "Starting video..."
         # Set when the decoder may hold broken references (decode error, lost
         # packets); cleared by the next full frame. Too long -> restart stream.
         self.dirty_since = 0.0
@@ -775,21 +775,6 @@ def pill_buttons(win_w: int) -> dict[str, pygame.Rect]:
     return out
 
 
-def wrap_text(font: pygame.font.Font, text: str, max_w: int) -> list[str]:
-    lines: list[str] = []
-    for paragraph in text.split("\n"):
-        line = ""
-        for word in paragraph.split():
-            trial = f"{line} {word}".strip()
-            if line and font.size(trial)[0] > max_w:
-                lines.append(line)
-                line = word
-            else:
-                line = trial
-        if line:
-            lines.append(line)
-    return lines
-
 
 def snap_to_edges(x: int, y: int, w: int, h: int) -> tuple[int, int]:
     """iOS starts system gestures (Home, Control Center, back) only from the very edge."""
@@ -899,40 +884,66 @@ def apply_setting(settings: dict, hit: str) -> bool:
     return False
 
 
-def draw_settings(screen: pygame.Surface, y0: int, w: int, h: int, settings: dict, font: pygame.font.Font) -> None:
+_OVERLAYS: dict[tuple, pygame.Surface] = {}
+
+
+def cached_overlay(key: tuple, w: int, h: int, build: Callable[[pygame.Surface], None]) -> pygame.Surface:
+    """A transparent w x h surface drawn by ``build`` once per ``key`` (overlays are redrawn every
+    video frame; building them takes a few ms, blitting a ready one almost nothing)."""
+    surf = _OVERLAYS.get(key)
+    if surf is None:
+        if len(_OVERLAYS) > 32:
+            _OVERLAYS.clear()
+        surf = pygame.Surface((max(1, w), max(1, h)), pygame.SRCALPHA)
+        build(surf)
+        _OVERLAYS[key] = surf
+    return surf
+
+
+def text_size(h: int) -> int:
+    """Body text size for a phone picture h px tall."""
+    return max(14, h // 62)
+
+
+def draw_settings(screen: pygame.Surface, y0: int, w: int, h: int, settings: dict) -> None:
+    key = ("settings", w, h, tuple(sorted(settings.items())))
+    screen.blit(cached_overlay(key, w, h, lambda s: _build_settings(s, w, h, settings)), (0, y0))
+
+
+def _build_settings(s: pygame.Surface, w: int, h: int, settings: dict) -> None:
     panel, hits = settings_layout(w, h)
-    p = panel.move(0, y0)
-    shade = pygame.Surface((w, h), pygame.SRCALPHA)
-    shade.fill((0, 0, 0, 120))
-    screen.blit(shade, (0, y0))
-    pygame.draw.rect(screen, (34, 34, 38), p, border_radius=18)
-    title = font.render("Settings", True, (255, 255, 255))
     row_h, head, _foot = _settings_metrics(h)
-    screen.blit(title, (p.left + 18, p.top + (head - title.get_height()) // 2))
+    ts = text_size(h)
+    s.fill((0, 0, 0, 130))
+    s.blit(style.round_rect(panel.w, panel.h, 20, style.PANEL), panel.topleft)
+    s.blit(style.round_rect(panel.w, panel.h, 20, style.PANEL_EDGE, 1), panel.topleft)
+    title = style.text("Settings", ts + 4, style.TEXT, "semibold")
+    s.blit(title, (panel.left + 20, panel.top + (head - title.get_height()) // 2))
     for i, (key, label, kind, *_rest) in enumerate(SETTING_ROWS):
-        cy = p.top + head + i * row_h + row_h // 2
-        img = font.render(label, True, (225, 225, 230))
-        screen.blit(img, (p.left + 18, cy - img.get_height() // 2))
+        top = panel.top + head + i * row_h
+        cy = top + row_h // 2
+        if i:
+            pygame.draw.line(s, style.HAIRLINE, (panel.left + 20, top), (panel.right - 20, top))
+        img = style.text(label, ts, style.TEXT)
+        s.blit(img, (panel.left + 20, cy - img.get_height() // 2))
         if kind == "pct":
-            for sign in "-+":
-                r = hits[key + sign].move(0, y0)
-                pygame.draw.circle(screen, (70, 70, 76), r.center, r.width // 2)
-                pygame.draw.line(screen, (255, 255, 255), (r.centerx - 7, r.centery), (r.centerx + 7, r.centery), 2)
-                if sign == "+":
-                    pygame.draw.line(screen, (255, 255, 255), (r.centerx, r.centery - 7), (r.centerx, r.centery + 7), 2)
-            val = font.render(f"{round(settings[key] * 100)}%", True, (255, 255, 255))
+            for sign, name in (("-", "minus"), ("+", "plus")):
+                r = hits[key + sign]
+                style.blit_center(s, style.circle(r.width, style.CONTROL), r.center)
+                style.blit_center(s, style.icon(name, int(r.width * 0.5), style.TEXT), r.center)
             mid = (hits[key + "-"].right + hits[key + "+"].left) // 2
-            screen.blit(val, (mid - val.get_width() // 2, cy - val.get_height() // 2))
+            style.blit_center(s, style.text(f"{round(settings[key] * 100)}%", ts, style.MUTED), (mid, cy))
         else:
-            r = hits[key].move(0, y0)
+            r = hits[key]
             on = bool(settings[key])
-            pygame.draw.rect(screen, (52, 199, 89) if on else (80, 80, 86), r, border_radius=r.height // 2)
-            knob = r.height // 2 - 3
-            pygame.draw.circle(screen, (255, 255, 255), (r.right - knob - 4 if on else r.left + knob + 4, r.centery), knob)
-    d = hits["done"].move(0, y0)
-    pygame.draw.rect(screen, (10, 132, 255), d, border_radius=d.height // 2)
-    txt = font.render("Done", True, (255, 255, 255))
-    screen.blit(txt, (d.centerx - txt.get_width() // 2, d.centery - txt.get_height() // 2))
+            s.blit(style.round_rect(r.w, r.h, r.h / 2, style.GREEN if on else style.CONTROL_OFF), r.topleft)
+            kd = r.h - 6
+            kx = r.right - 3 - kd / 2 if on else r.left + 3 + kd / 2
+            style.blit_center(s, style.circle(kd + 2, (0, 0, 0, 70)), (kx, cy + 1))  # knob shadow
+            style.blit_center(s, style.circle(kd, (255, 255, 255)), (kx, cy))
+    d = hits["done"]
+    s.blit(style.round_rect(d.w, d.h, d.h / 2, style.ACCENT), d.topleft)
+    style.blit_center(s, style.text("Done", ts, (255, 255, 255), "semibold"), d.center)
 
 
 class ScrollGesture:
@@ -1141,67 +1152,69 @@ def position_on_screen(x: int, y: int) -> bool:
     return False
 
 
+PILL_TIPS = {
+    "home": "Home  ·  F1", "switcher": "App Switcher  ·  F4", "rotate": "Rotate", "keypad": "Passcode keypad",
+    "settings": "Settings", "minimize": "Minimize", "close": "Close",
+}
+
+
 def draw_pill(screen: pygame.Surface, win_w: int, hover: Optional[str], keypad_on: bool, settings_on: bool = False) -> None:
     pr = pill_rect(win_w)
-    pygame.draw.rect(screen, (38, 38, 40), pr, border_radius=BAR_H // 2)
+    key = ("pill", win_w, hover, keypad_on, settings_on)
+    screen.blit(cached_overlay(key, pr.w, pr.h, lambda s: _build_pill(s, win_w, hover, keypad_on, settings_on)), pr.topleft)
+    tip = PILL_TIPS.get(hover or "")
+    if tip:  # over the top of the phone picture, below the Dynamic Island (~0.1 of the width deep)
+        img = style.toast(tip, 13, bg=(18, 18, 20, 235))
+        x = min(max(8, pill_buttons(win_w)[hover].centerx - img.get_width() // 2), win_w - img.get_width() - 8)  # type: ignore[index]
+        screen.blit(img, (x, phone_origin_y() + int(win_w * 0.12)))
+
+
+def _build_pill(s: pygame.Surface, win_w: int, hover: Optional[str], keypad_on: bool, settings_on: bool) -> None:
+    pr = pill_rect(win_w)
+    s.blit(style.round_rect(pr.w, pr.h, pr.h / 2, style.PILL), (0, 0))
     btns = pill_buttons(win_w)
     for name, r in btns.items():
-        if hover == name or (name == "keypad" and keypad_on) or (name == "settings" and settings_on):
-            pygame.draw.circle(screen, (70, 70, 74), r.center, BAR_H // 2 - 3)
-    fg = (225, 225, 230)
-    cx, cy = btns["home"].center
-    pygame.draw.polygon(screen, fg, [(cx - 7, cy), (cx, cy - 7), (cx + 7, cy)])
-    pygame.draw.rect(screen, fg, pygame.Rect(cx - 5, cy, 10, 7))
-    cx, cy = btns["switcher"].center  # App Switcher: two app cards, one behind the other
-    pygame.draw.rect(screen, fg, pygame.Rect(cx - 2, cy - 8, 9, 13), 2, border_radius=2)
-    pygame.draw.rect(screen, (38, 38, 40) if hover != "switcher" else (70, 70, 74), pygame.Rect(cx - 7, cy - 4, 9, 13), border_radius=2)
-    pygame.draw.rect(screen, fg, pygame.Rect(cx - 7, cy - 4, 9, 13), 2, border_radius=2)
-    cx, cy = btns["rotate"].center
-    pygame.draw.arc(screen, fg, pygame.Rect(cx - 7, cy - 7, 14, 14), 0.6, 5.6, 2)
-    pygame.draw.polygon(screen, fg, [(cx + 4, cy - 9), (cx + 9, cy - 3), (cx + 2, cy - 2)])
-    cx, cy = btns["keypad"].center
-    for dx in (-5, 0, 5):
-        for dy in (-5, 0, 5):
-            pygame.draw.circle(screen, fg, (cx + dx, cy + dy), 1)
-    cx, cy = btns["settings"].center
-    for k in range(8):  # gear: ring + teeth
-        a = k * math.pi / 4
-        pygame.draw.line(screen, fg, (cx + 5 * math.cos(a), cy + 5 * math.sin(a)), (cx + 8 * math.cos(a), cy + 8 * math.sin(a)), 2)
-    pygame.draw.circle(screen, fg, (cx, cy), 5, 2)
-    cx, cy = btns["minimize"].center
-    pygame.draw.line(screen, fg, (cx - 6, cy + 3), (cx + 6, cy + 3), 2)
-    cx, cy = btns["close"].center
-    pygame.draw.line(screen, fg, (cx - 5, cy - 5), (cx + 5, cy + 5), 2)
-    pygame.draw.line(screen, fg, (cx - 5, cy + 5), (cx + 5, cy - 5), 2)
-    gx = (btns[PILL_LEFT[-1]].right + btns["minimize"].left) // 2  # grip: drag elsewhere on the pill to move
+        center = (r.centerx - pr.left, r.centery)
+        active = (name == "keypad" and keypad_on) or (name == "settings" and settings_on)
+        bg = (style.CLOSE_HOVER if name == "close" else style.PILL_HOVER) if hover == name else style.PILL_ACTIVE if active else None
+        if bg:
+            style.blit_center(s, style.circle(BAR_H - 6, bg), center)
+        style.blit_center(s, style.icon(name, 18, style.TEXT), center)
+    gx = (btns[PILL_LEFT[-1]].right + btns["minimize"].left) // 2 - pr.left  # grip: drag elsewhere on the pill to move
     for i in (-1, 0, 1):
-        pygame.draw.circle(screen, (120, 120, 126), (gx + i * 7, pr.centery), 2)
+        style.blit_center(s, style.circle(4, (112, 112, 118)), (gx + i * 7, pr.h / 2))
 
 
-def draw_keypad(screen: pygame.Surface, y0: int, w: int, h: int, font: pygame.font.Font, big: pygame.font.Font) -> None:
+KEYPAD_LETTERS = {"2": "ABC", "3": "DEF", "4": "GHI", "5": "JKL", "6": "MNO", "7": "PQRS", "8": "TUV", "9": "WXYZ"}
+
+
+def draw_keypad(screen: pygame.Surface, y0: int, w: int, h: int) -> None:
+    screen.blit(cached_overlay(("keypad", w, h), w, h, lambda s: _build_keypad(s, w, h)), (0, y0))
+
+
+def _build_keypad(s: pygame.Surface, w: int, h: int) -> None:
     panel, keys = keypad_layout(w, h)
-    shade = pygame.Surface(panel.size, pygame.SRCALPHA)
-    shade.fill((0, 0, 0, 150))
-    screen.blit(shade, (panel.left, y0 + panel.top))
-    hint = font.render("Enter passcode (or type it)", True, (235, 235, 240))
-    screen.blit(hint, (panel.centerx - hint.get_width() // 2, y0 + panel.top + 8))
+    ts = text_size(h)
+    s.fill((0, 0, 0, 150))
+    style.blit_center(s, style.text("Enter Passcode", ts + 4, style.TEXT, "semibold"), (panel.centerx, panel.top + 16))
     for label, r in keys.items():
-        rr = r.move(0, y0)
-        if label == "show":
-            pygame.draw.rect(screen, (10, 132, 255), rr, border_radius=rr.height // 2)
-            img = font.render("Show passcode screen", True, (255, 255, 255))
-            screen.blit(img, (rr.centerx - img.get_width() // 2, rr.centery - img.get_height() // 2))
-            continue
-        pygame.draw.circle(screen, (90, 90, 96), rr.center, r.width // 2)
-        if label == "del":  # backspace symbol, drawn (not every font has the glyph)
-            cx, cy, k = rr.centerx, rr.centery, max(6, r.width // 6)
-            pts = [(cx - 2 * k, cy), (cx - k, cy - k), (cx + 2 * k, cy - k), (cx + 2 * k, cy + k), (cx - k, cy + k)]
-            pygame.draw.polygon(screen, (255, 255, 255), pts, 2)
-            pygame.draw.line(screen, (255, 255, 255), (cx, cy - k // 2), (cx + k, cy + k // 2), 2)
-            pygame.draw.line(screen, (255, 255, 255), (cx, cy + k // 2), (cx + k, cy - k // 2), 2)
-            continue
-        img = big.render(label, True, (255, 255, 255))
-        screen.blit(img, (rr.centerx - img.get_width() // 2, rr.centery - img.get_height() // 2))
+        if label == "show":  # iOS may time the passcode screen out; this brings it back
+            s.blit(style.round_rect(r.w, r.h, r.h / 2, (255, 255, 255, 46)), r.topleft)
+            style.blit_center(s, style.text("Show passcode screen", ts, style.TEXT, "semibold"), r.center)
+        elif label == "del":
+            style.blit_center(s, style.icon("backspace", int(r.width * 0.42), style.TEXT), r.center)
+        else:
+            style.blit_center(s, style.circle(r.width, (255, 255, 255, 46)), r.center)
+            letters = KEYPAD_LETTERS.get(label)
+            digit = style.text(label, int(r.width * 0.40), style.TEXT)
+            if letters:
+                style.blit_center(s, digit, (r.centerx, r.centery - r.height * 0.09))
+                style.blit_center(s, style.text(letters, max(9, int(r.width * 0.115)), style.TEXT, "semibold"),
+                                  (r.centerx, r.centery + r.height * 0.24))
+            else:
+                style.blit_center(s, digit, r.center)
+    style.blit_center(s, style.text("You can also type it on your keyboard", max(12, ts - 1), (200, 200, 208)),
+                      (panel.centerx, min(h - 30, panel.bottom + 20)))
 
 
 def privacy_blur(picture: pygame.Surface) -> pygame.Surface:
@@ -1216,18 +1229,50 @@ def privacy_blur(picture: pygame.Surface) -> pygame.Surface:
     return out
 
 
-def draw_locked(
-    screen: pygame.Surface, y0: int, w: int, h: int, font: pygame.font.Font, big: pygame.font.Font, title: str
-) -> None:
-    cx, cy = w // 2, y0 + h // 2
-    r = max(36, min(w, h) // 8)
-    pygame.draw.circle(screen, (255, 255, 255), (cx, cy), r, 3)
-    # padlock
-    pygame.draw.rect(screen, (255, 255, 255), pygame.Rect(cx - r // 3, cy - r // 8, 2 * r // 3, r // 2), border_radius=4)
-    pygame.draw.arc(screen, (255, 255, 255), pygame.Rect(cx - r // 4, cy - r // 2, r // 2, r // 2), 0, 3.15, 3)
-    for i, line in enumerate((title, "Click to wake")):
-        img = (big if i else font).render(line, True, (255, 255, 255))
-        screen.blit(img, (cx - img.get_width() // 2, cy + r + 14 + i * (font.get_height() + 10)))
+def draw_locked(screen: pygame.Surface, y0: int, w: int, h: int, title: str) -> None:
+    screen.blit(cached_overlay(("locked", w, h, title), w, h, lambda s: _build_locked(s, w, h, title)), (0, y0))
+
+
+def _build_locked(s: pygame.Surface, w: int, h: int, title: str) -> None:
+    cx, cy = w // 2, int(h * 0.44)
+    d = max(76, min(w, h) // 4)
+    style.blit_center(s, style.circle(d, (255, 255, 255, 38)), (cx, cy))  # frosted disc
+    style.blit_center(s, style.round_rect(d, d, d / 2, (255, 255, 255, 90), 1.5), (cx, cy))
+    style.blit_center(s, style.icon("phone" if title.startswith("Waiting") else "lock", int(d * 0.46), style.TEXT), (cx, cy))
+    head = style.text(title, max(20, h // 36), style.TEXT, "semibold")
+    y = cy + d // 2 + 22
+    style.blit_center(s, head, (cx, y + head.get_height() // 2))
+    sub = style.text("Click to wake", text_size(h) + 1, (222, 222, 230))
+    style.blit_center(s, sub, (cx, y + head.get_height() + 6 + sub.get_height() // 2))
+
+
+def draw_connecting(screen: pygame.Surface, y0: int, w: int, h: int, status: str, failed: bool, t: float, body: bool = True) -> None:
+    """Shown until the first video frame: app icon and name, then progress (spinner) or the error."""
+    screen.blit(style.vertical_gradient(w, h, (36, 36, 40), (14, 14, 16)), (0, y0))
+    if not body:
+        return
+    cx, cy = w // 2, y0 + int(h * 0.36)
+    size = max(64, w // 6)
+    style.blit_center(screen, app_icon(size), (cx, cy))
+    name = style.text("PhonyScreen", max(22, h // 32), style.TEXT, "semibold")
+    y = cy + size // 2 + 16
+    screen.blit(name, (cx - name.get_width() // 2, y))
+    y += name.get_height() + 30
+    ts = text_size(h)
+    if failed:
+        style.blit_center(screen, style.icon("warning", 30, style.WARN), (cx, y + 15))
+        y += 42
+        head = style.text("Couldn't connect", ts + 2, style.TEXT, "semibold")
+        screen.blit(head, (cx - head.get_width() // 2, y))
+        y += head.get_height() + 6
+        status = status.removeprefix("Couldn't connect: ")
+    else:
+        style.blit_center(screen, style.spinner(24, int(t * 12) % 12, style.MUTED), (cx, y + 12))
+        y += 40
+    for line in style.wrap(status, ts, w - 72):
+        img = style.text(line, ts, style.MUTED)
+        screen.blit(img, (cx - img.get_width() // 2, y))
+        y += img.get_height() + 2
 
 
 def main(
@@ -1288,10 +1333,8 @@ def main(
     screen = pygame.display.set_mode(win_size, pygame.NOFRAME)
     pygame.display.set_caption("PhonyScreen")
     with contextlib.suppress(Exception):
-        pygame.display.set_icon(make_icon(64))
+        pygame.display.set_icon(app_icon(64))
     apply_window_shape(win_size[0], *placeholder)
-    font = pygame.font.SysFont("segoeui,arial", max(14, target_h // 60))
-    big = pygame.font.SysFont("segoeui,arial", max(22, target_h // 30))
 
     box: dict[str, Any] = {"status": "Connecting..."}
     ready = threading.Event()
@@ -1306,6 +1349,7 @@ def main(
     last_clip_seq = 0
     last_synced_clip: Optional[str] = None
     last_seq = -1
+    got_picture = False  # until the first frame, the connecting screen shows (with a spinner)
     bright: Optional[tuple] = None  # last frame with the screen on, shown while locked
     disp = placeholder  # size of the phone picture as shown
     rot_manual = 0
@@ -1363,6 +1407,7 @@ def main(
     while running:
         busy = scroll.active or pinch.active or resize_at or (box.get("mirror") and box["mirror"].phone_clip
                                                                 and box["mirror"].phone_clip[0] != last_clip_seq)
+        busy = busy or (not got_picture and "error" not in box)  # keep the spinner turning
         events = [pygame.event.wait(30 if busy else 250)]
         events += pygame.event.get()
         now = time.perf_counter()
@@ -1693,20 +1738,21 @@ def main(
             screen.blit(blur_cache["surf"], (0, y0))
         elif picture is not None:
             screen.blit(picture, (0, y0))
-        else:
-            pygame.draw.rect(screen, (24, 24, 26), pygame.Rect(0, y0, win_size[0], win_size[1] - y0))
+        else:  # no video yet: app name and progress, or why it couldn't connect
+            draw_connecting(screen, y0, win_size[0], win_size[1] - y0, status, "error" in box, now, body=not idle)
+        got_picture = got_picture or picture is not None
         draw_pill(screen, win_size[0], hover, keypad_on, settings_on)
         if idle and not keypad_on:
             title = "Waiting for your iPhone" if stream_stopped else "iPhone is locked"
-            draw_locked(screen, y0, disp[0], disp[1], font, big, title)
+            draw_locked(screen, y0, disp[0], disp[1], title)
         if keypad_on and picture is not None:
-            draw_keypad(screen, y0, disp[0], disp[1], font, big)
+            draw_keypad(screen, y0, disp[0], disp[1])
         if settings_on:
-            draw_settings(screen, y0, disp[0], disp[1], settings, font)
+            draw_settings(screen, y0, disp[0], disp[1], settings)
 
         lines: list[str] = []
-        if status:
-            lines.extend(wrap_text(font, status, win_size[0] - 48))
+        if status and picture is not None:  # without a picture, the connecting screen shows it
+            lines.extend(style.wrap(status, max(13, disp[1] // 66), win_size[0] - 64))
         if show_stats and mirror is not None:
             st = mirror.stats
             with st.lock:
@@ -1716,15 +1762,11 @@ def main(
                     f"decode {Stats.avg(st.decode_ms):4.1f} ms | convert {Stats.avg(st.convert_ms):4.1f} ms"
                     f" | restarts {st.restarts}"
                 )
-        y = y0 + max(40, int(disp[1] * 0.06))  # below the rounded corners and the camera cut-out
+        y = y0 + max(44, int(disp[1] * 0.065))  # below the rounded corners and the camera cut-out
         for line in lines:
-            img = font.render(line, True, (255, 255, 255))
-            bg = pygame.Surface((img.get_width() + 12, img.get_height() + 6), pygame.SRCALPHA)
-            bg.fill((0, 0, 0, 170))
-            x = (win_size[0] - bg.get_width()) // 2
-            screen.blit(bg, (x, y))
-            screen.blit(img, (x + 6, y + 3))
-            y += img.get_height() + 8
+            img = style.toast(line, max(13, disp[1] // 66))
+            screen.blit(img, ((win_size[0] - img.get_width()) // 2, y))
+            y += img.get_height() + 6
         pygame.display.flip()
 
     wp = window_position()
@@ -1738,19 +1780,11 @@ def main(
     return 0
 
 
-def make_icon(size: int = 256) -> pygame.Surface:
-    """PhonyScreen icon: a rounded phone on a blue tile (drawn, so no image file is needed)."""
-    s = pygame.Surface((size, size), pygame.SRCALPHA)
-    pygame.draw.rect(s, (32, 120, 255), s.get_rect(), border_radius=size // 5)
-    pw, ph = int(size * 0.42), int(size * 0.74)
-    phone = pygame.Rect((size - pw) // 2, (size - ph) // 2, pw, ph)
-    pygame.draw.rect(s, (255, 255, 255), phone, border_radius=size // 10)
-    inner = phone.inflate(-size // 14, -size // 14)
-    pygame.draw.rect(s, (20, 24, 32), inner, border_radius=size // 14)
-    pill = pygame.Rect(0, 0, pw // 3, max(2, size // 28))
-    pill.midtop = (phone.centerx, inner.top + size // 30)
-    pygame.draw.rect(s, (255, 255, 255), pill, border_radius=pill.height // 2)
-    return s
+@lru_cache(maxsize=8)
+def app_icon(size: int) -> pygame.Surface:
+    """The app icon (drawn by phonyscreen/appicon.py, like the exe's .ico) as a pygame surface."""
+    img = appicon.render(size)
+    return pygame.image.frombytes(img.tobytes(), img.size, "RGBA")
 
 
 if __name__ == "__main__":
