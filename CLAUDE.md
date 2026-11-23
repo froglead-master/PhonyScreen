@@ -26,7 +26,7 @@ Formerly named PhonePane (old repo froglead-master/PhonePane, renamed 2026-11-23
 ## Hard-won facts (don't relearn these)
 - Video: CoreDevice DisplayService, HEVC over RTP through the RSD tunnel. Needs Developer Mode and the developer disk image mounted after each phone reboot.
 - Decode in software (PyAV, slice threads). Hardware HEVC on Snapdragon shows green flashes on this stream.
-- Never pause decoding waiting for a keyframe (the base class's refresh loop caused 7 s freezes). On errors: one PLI; if no IDR within 1 s, restart the stream. Watchdog restarts with back-off (5→30 s), because each restart makes iOS show a "viewed remotely" banner.
+- Never pause decoding waiting for a keyframe (the base class's refresh loop caused 7 s freezes). On errors: one PLI; if no IDR within 1 s, restart the stream. Watchdog restarts with back-off (5→30 s, counted from any restart), because each restart makes iOS show a "viewed remotely" banner. Every restart opens with a keyframe burst even from an asleep phone, so the back-off resets only when frames still arrive ≥10 s after the last restart (`STEADY_SECONDS`).
 - Locked phone keeps streaming pure black frames → `frame_is_black` → blurred last frame + "Click to wake" (privacy: blur must stay unreadable).
 - Touch: 0..65535 normalized, mainTouchscreen surface (257). Send samples ≥16 ms apart (`_paced_pointer`). iOS does NOT act on injected Home swipes from the bottom edge, so `_track_home_swipe` presses the Home button (Consumer 0x0C/0x40) at the end of such a swipe. Swipe up on the lock screen does work (used to reach the passcode screen after wake).
 - The gesture surface 1281 (19-byte rid 0x13 pointer reports) is unexplored. It might be the route to real system gestures (Home, App Switcher).
@@ -49,7 +49,7 @@ Not working / to verify:
 Phone → Windows clipboard confirmed on 2026-11-23: plain text field, WhatsApp, Gmail (arrives within ~50 ms; log "phone copy -> Windows clipboard").
 - Rich copies (Gmail/WebKit) list ~8 types in an order that changes per copy. pymobiledevice3 reads only the primary type inline (`promiseSecondary`), so `phoneclip` extracts text from inline HTML or a web archive. For any other primary type, `allow_full_pull` (monitor + `_clip_pull_loop`) pulls every representation: 0.14 s for Gmail, up to ~64 s for Notes-style copies (pasteboard only, not video). An RTF-first copy relies on that full pull; untested.
 - Oddity seen only after a host SET (PC → phone): a PULL can report the new changeCount with the previous contents, or types with empty data. Phone copies were always read correctly.
-- Watchdog back-off never grows: each restart's opening frames update `last_feed_t`, so `_watchdog` resets `backoff` to 5 s and restarts every ~13–20 s while the phone sleeps (each one a "viewed remotely" notification).
+- Watchdog back-off while the phone sleeps: fixed 2026-11-23 (it used to reset to 5 s on each restart's opening frames, restarting every ~13–20 s). Checked with an offline timing simulation (gaps 10→20→30 s, reset after steady video); not yet on hardware. To verify: let the phone sleep with PhonyScreen open; the log's "restarting stream: no video" lines should space out to 30 s.
 - The owner can't do two-finger touchpad swipes comfortably; the pointer drag and touchscreen paths are what matter.
 Ideas / not done:
 - App Switcher gesture; explore surface 1281 for real system gestures.

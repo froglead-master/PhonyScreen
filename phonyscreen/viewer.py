@@ -49,6 +49,7 @@ logger = logging.getLogger("phonyscreen.viewer")
 
 STALL_SECONDS = 6.0  # no video for this long -> restart the stream
 RESTART_BACKOFF = 5.0  # min gap between "no video" restart attempts
+STEADY_SECONDS = 10.0  # video still arriving this long after a restart -> back-off resets
 TOUCH_INTERVAL = 0.016  # min gap between drag samples sent to the phone (finger-like cadence)
 HOME_SWIPE_EDGE = 0.05  # a drag starting in the bottom 5% of the screen ...
 HOME_SWIPE_DISTANCE = 0.10  # ... and going up at least 10% of it is a Home swipe
@@ -177,6 +178,8 @@ class LeanDecoder:
 
 class LeanMirror(vs.VncStreamServer):
     """pymobiledevice3's stream server with the VNC side replaced by a local window."""
+
+    restart_t = 0.0  # when the stream was last restarted (any reason)
 
     def __init__(self, rsd: Any, target_height: int) -> None:
         phoneclip.install()  # Gmail/browser copies often carry only HTML inline: read their text from it
@@ -559,6 +562,7 @@ class LeanMirror(vs.VncStreamServer):
     # -- stream watchdog -----------------------------------------------------
     async def _restart_stream(self, why: str) -> None:
         logger.info("restarting stream: %s", why)
+        self.restart_t = time.perf_counter()
         try:
             await self._switch_video()
             self.stats.restarts += 1
@@ -567,7 +571,6 @@ class LeanMirror(vs.VncStreamServer):
         self.dirty_since = 0.0
 
     async def _watchdog(self) -> None:
-        last_stall_restart = 0.0
         backoff = RESTART_BACKOFF
         while True:
             await asyncio.sleep(0.1)
@@ -578,14 +581,16 @@ class LeanMirror(vs.VncStreamServer):
                 continue
             # 2) No video at all (phone asleep, stream died). Each restart makes iOS post a
             #    "viewed remotely" notification, so back off while nothing comes through;
-            #    clicking "wake" restarts right away (request_restart).
+            #    clicking "wake" restarts right away (request_restart). Every restart
+            #    opens with a keyframe burst even from an asleep phone, so the back-off
+            #    resets only once frames still arrive STEADY_SECONDS after the restart.
             idle = now - self.last_feed_t
             if idle < STALL_SECONDS:
                 self.status = ""
-                backoff = RESTART_BACKOFF
+                if self.last_feed_t - self.restart_t >= STEADY_SECONDS:
+                    backoff = RESTART_BACKOFF
                 continue
-            if now - last_stall_restart >= backoff:
-                last_stall_restart = now
+            if now - self.restart_t >= backoff:  # counted from any restart, "wake" included
                 await self._restart_stream(f"no video for {idle:.1f}s (next try in {min(backoff * 2, 30):.0f}s)")
                 backoff = min(backoff * 2, 30.0)
 
