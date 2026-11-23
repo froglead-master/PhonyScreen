@@ -14,7 +14,7 @@ PhonyScreen shows your iPhone's screen in a window on Windows and lets you use i
 - Tap, swipe and type from Windows; Home, App Switcher and Lock buttons
 - USB or Wi-Fi (Wi-Fi finds the phone on your network by itself)
 - Phone sound plays on the PC's speakers (PhonyScreen mutes the iPhone's own speaker meanwhile and unmutes it when you close PhonyScreen)
-- Shared clipboard: copy text on the phone, paste it in Windows, and the other way round
+- Shared clipboard: copy text or a picture on the phone, paste it in Windows, and the other way round
 - Locked phone: wake it and enter your passcode from the laptop with the built-in keypad (iOS hides its own number pad from screen capture)
 - Video restarts on its own if the stream stops
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
 import queue
@@ -52,6 +53,7 @@ logger = logging.getLogger("phonyscreen.viewer")
 STALL_SECONDS = 6.0  # no video for this long -> restart the stream
 RESTART_BACKOFF = 5.0  # min gap between "no video" restart attempts
 STEADY_SECONDS = 10.0  # video still arriving this long after a restart -> back-off resets
+FROZEN_SECONDS = 3.0  # video data still arriving but no picture this long -> restart the stream
 TOUCH_INTERVAL = 0.016  # min gap between drag samples sent to the phone (finger-like cadence)
 HOME_SWIPE_EDGE = 0.05  # a drag starting in the bottom 5% of the screen ...
 HOME_SWIPE_DISTANCE = 0.10  # ... and going up at least 10% of it is a Home swipe
@@ -120,6 +122,7 @@ class LeanDecoder:
         with contextlib.suppress(Exception):
             list(self._codec.decode(av.Packet(b"".join(b"\x00\x00\x00\x01" + n for n in (vps, sps, pps)))))
         self._q: queue.Queue[Optional[tuple[bytes, float]]] = queue.Queue()
+        self._last_shown = 0.0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="lean-hevc", daemon=True)
         self._thread.start()
@@ -162,11 +165,13 @@ class LeanDecoder:
                 self._server._on_decode_error_from_worker()
                 continue
             # Every AU must be decoded (later frames reference it), but only the
-            # newest one needs converting for display.
-            if not self._q.empty():
+            # newest one needs converting for display -- yet show one at least every
+            # 0.1 s, or a decoder that's behind never shows anything.
+            if not self._q.empty() and t1 - self._last_shown < 0.1:
                 with stats.lock:
                     stats.skipped += 1
                 continue
+            self._last_shown = t1
             frame = frames[-1]
             rgb = frame.reformat(width=self.out_w, height=self.out_h, format="rgb24", interpolation="FAST_BILINEAR")
             plane = rgb.planes[0]
@@ -195,6 +200,7 @@ class LeanMirror(vs.VncStreamServer):
             # to ~64 s for a Notes copy (pasteboard only, not video); otherwise it never arrives.
             self._clipboard_monitor._allow_full_pull = True
         self.target_height = target_height
+        self.last_frame_t = time.perf_counter()  # last picture handed to the window
         self.stats = Stats()
         self.last_feed_t = time.perf_counter()
         self.slot: Optional[tuple[bytes, int, int, int, int, float, int]] = None
@@ -216,6 +222,8 @@ class LeanMirror(vs.VncStreamServer):
         self.client = vs._VncClient(None, None)  # type: ignore[arg-type]
         self._touch_last: Optional[tuple[int, int, float]] = None  # last drag sample (x, y, time)
         self.phone_clip: Optional[tuple[int, str]] = None  # (sequence, text) last copied on the phone
+        self.phone_image: Optional[tuple[int, bytes]] = None  # (sequence, PNG/JPEG...) picture copied on the phone
+        self._pushed_images: set[str] = set()  # hashes of pictures sent from Windows (not phone copies)
         self.player: Optional[Any] = None  # phonyscreen.audio.AudioPlayer, when sound is on
         self.sound_wanted = True
         self.mute_phone_wanted = True  # mute the phone's own speaker while its sound plays here
@@ -264,6 +272,7 @@ class LeanMirror(vs.VncStreamServer):
             task.add_done_callback(self._pli_tasks.discard)
 
     def deliver(self, data: bytes, w: int, h: int, vw: int, vh: int, t_in: float) -> None:
+        self.last_frame_t = time.perf_counter()  # the watchdog's "picture still moving" signal
         with self.slot_lock:
             self.frame_seq += 1
             self.slot = (data, w, h, vw, vh, t_in, self.frame_seq)
@@ -334,6 +343,13 @@ class LeanMirror(vs.VncStreamServer):
                     if self._clipboard_monitor is not None:
                         await self._clipboard_monitor.set_text(ev[1])
                         self._clip_known = ev[1]
+                        await self._clipboard_set_done()  # a Ctrl+V right behind must paste this
+                elif ev[0] == "clip_image_to_phone":
+                    if self._clipboard_monitor is not None:
+                        self._pushed_images.add(hashlib.sha1(ev[1]).hexdigest())
+                        await self._clipboard_monitor.set_image(ev[1], "public.png")
+                        self._clip_known = None  # typing ç/ş can't put a picture back
+                        await self._clipboard_set_done()
                 elif ev[0] == "button":
                     page, code = ev[1]
                     await self._send_hid_button(page, code, down=True)
@@ -599,14 +615,18 @@ class LeanMirror(vs.VncStreamServer):
         monitor = self._clipboard_monitor
         if monitor is not None:
             await monitor.set_text(text)  # the monitor recognises its own changes
-            pending = list(monitor._set_tasks)  # SET_REPLY = the phone's clipboard holds it now
-            if pending:
-                await asyncio.wait(pending, timeout=2.0)
+            await self._clipboard_set_done()
         else:
             from pymobiledevice3.remote.core_device import pasteboard_service as pb
 
             async with pb.PasteboardService(self._rsd) as service:
                 await asyncio.wait_for(service.set_text(text), 3.0)
+
+    async def _clipboard_set_done(self, timeout: float = 3.0) -> None:
+        """Wait for the monitor's pending SETs: their SET_REPLY means the phone's clipboard holds it."""
+        pending = list(self._clipboard_monitor._set_tasks) if self._clipboard_monitor is not None else []
+        if pending:
+            await asyncio.wait(pending, timeout=timeout)
 
     async def _restore_phone_clipboard(self) -> None:
         await asyncio.sleep(RESTORE_AFTER)
@@ -619,6 +639,15 @@ class LeanMirror(vs.VncStreamServer):
         text = getattr(content, "text", None)
         if text in self._typed_texts:
             return  # put there to type it (possibly read back stale), not a copy on the phone
+        image = getattr(content, "image", None)
+        if image and not text:
+            if hashlib.sha1(image).hexdigest() in self._pushed_images:
+                return  # the picture Windows sent, read back
+            logger.info("phone clipboard changed (picture, %d KB, %s)", len(image) // 1024, getattr(content, "image_uti", "?"))
+            self._clip_known = None
+            self._clip_seq += 1
+            self.phone_image = (self._clip_seq, image)
+            return
         logger.info("phone clipboard changed (%s)", f"{len(text)} chars of text" if text else "no text")
         if text:
             self._clip_known = text
@@ -663,9 +692,17 @@ class LeanMirror(vs.VncStreamServer):
             #    opens with a keyframe burst even from an asleep phone, so the back-off
             #    resets only once frames still arrive STEADY_SECONDS after the restart.
             idle = now - self.last_feed_t
+            # 3) Data keeps coming but no picture comes out (e.g. packets lost while a big
+            #    clipboard picture crossed the tunnel, and decoding never resynced). Check 1
+            #    misses it once a keyframe *arrives*, check 2 because data arrives.
+            frozen = now - self.last_frame_t
+            if idle < 1.0 and frozen > FROZEN_SECONDS and now - self.restart_t >= max(FROZEN_SECONDS, backoff):
+                await self._restart_stream(f"video data but no picture for {frozen:.1f}s")
+                backoff = min(backoff * 2, 30.0)
+                continue
             if idle < STALL_SECONDS:
                 self.status = ""
-                if self.last_feed_t - self.restart_t >= STEADY_SECONDS:
+                if self.last_frame_t - self.restart_t >= STEADY_SECONDS:  # pictures, not just data
                     backoff = RESTART_BACKOFF
                 continue
             if now - self.restart_t >= backoff:  # counted from any restart, "wake" included
@@ -1411,6 +1448,8 @@ def main(
     show_stats = args.stats or bool(settings["stats"])
     settings_on = False
     last_clip_seq = 0
+    last_image_seq = 0
+    last_clip_seqno = -1  # Windows' clipboard counter when we last read or wrote it
     last_synced_clip: Optional[str] = None
     last_seq = -1
     got_picture = False  # until the first frame, the connecting screen shows (with a spinner)
@@ -1511,17 +1550,43 @@ def main(
                 press_key(ord(label))
                 keypad_digits += 1
 
-        def push_windows_clipboard() -> None:
-            """Windows -> phone, so a paste on the phone gets what was copied on the PC."""
-            nonlocal last_synced_clip
+        def push_windows_clipboard(then_paste: bool = False) -> bool:
+            """Windows -> phone, so a paste on the phone gets what was copied on the PC. A picture is
+            converted on another thread (big ones take a second); with ``then_paste`` that thread
+            presses Cmd+V once the picture is on the phone, and this returns True."""
+            nonlocal last_synced_clip, last_clip_seqno
             if not settings["clipboard"] or mirror is None:
-                return
+                return False
             from phonyscreen import winclip
 
+            seqno = winclip.sequence_number()
+            if seqno == last_clip_seqno:
+                return False  # unchanged since we last looked, or what we put there from the phone
+            last_clip_seqno = seqno
             text = winclip.get_text()
-            if text and text != last_synced_clip:
-                last_synced_clip = text
-                mirror.post_input("clip_to_phone", text)
+            if text:
+                if text != last_synced_clip:
+                    last_synced_clip = text
+                    mirror.post_input("clip_to_phone", text)
+                return False
+            if not winclip.has_image():
+                return False
+            target = mirror
+
+            def send_picture() -> None:
+                png = winclip.get_image_png()
+                digest = hashlib.sha1(png).hexdigest() if png else ""
+                if png and digest != box.get("last_picture_sent"):  # Snipping Tool updates the clipboard twice
+                    box["last_picture_sent"] = digest
+                    logger.info("Windows picture -> phone clipboard (%d KB)", len(png) // 1024)
+                    target.post_input("clip_image_to_phone", png)
+                if then_paste:
+                    for e in (("key", True, CMD_KEYSYM), ("key", True, pygame.K_v), ("key", False, pygame.K_v),
+                              ("key", False, CMD_KEYSYM)):
+                        target.post_input(*e)
+
+            threading.Thread(target=send_picture, daemon=True, name="clipboard-picture").start()
+            return then_paste
 
         def settings_click(pos: tuple[int, int]) -> bool:
             """Handle a click while the settings panel is open; True if it was consumed."""
@@ -1726,11 +1791,11 @@ def main(
                         keysym = 0
                     elif ctrl and 0x20 <= ev.key <= 0x7E:
                         # Ctrl+C / V / X / A / Z ... -> Command+key, the iPhone's shortcuts
-                        if ev.key == pygame.K_v:
-                            push_windows_clipboard()
-                        for e in (("key", True, CMD_KEYSYM), ("key", True, ev.key), ("key", False, ev.key),
-                                  ("key", False, CMD_KEYSYM)):
-                            mirror.post_input(*e)
+                        deferred = ev.key == pygame.K_v and push_windows_clipboard(then_paste=True)
+                        if not deferred:  # (a picture pastes once it's on the phone)
+                            for e in (("key", True, CMD_KEYSYM), ("key", True, ev.key), ("key", False, ev.key),
+                                      ("key", False, CMD_KEYSYM)):
+                                mirror.post_input(*e)
                         if ev.key in (pygame.K_c, pygame.K_x) and settings["clipboard"]:
                             mirror.pull_phone_clipboard(0.5)  # the copy lands on the phone, then comes here
                         keysym = 0
@@ -1755,7 +1820,28 @@ def main(
 
                     last_synced_clip = clip[1]
                     ok = winclip.set_text(clip[1], pygame.display.get_wm_info().get("window"))
+                    last_clip_seqno = winclip.sequence_number()  # ours: don't send it back
                     logger.info("phone copy -> Windows clipboard (%d chars)%s", len(clip[1]), "" if ok else " FAILED")
+            phone_pic = mirror.phone_image
+            if phone_pic is not None and phone_pic[0] != last_image_seq:
+                last_image_seq = phone_pic[0]
+                if settings["clipboard"]:
+                    from phonyscreen import winclip
+
+                    def convert(data: bytes = phone_pic[1]) -> None:  # big photos take a second: not here
+                        box["clip_formats"] = (winclip.image_formats(data), len(data))
+                        with contextlib.suppress(Exception):
+                            pygame.event.post(pygame.event.Event(NEWFRAME))
+
+                    threading.Thread(target=convert, daemon=True, name="clipboard-picture").start()
+            converted = box.pop("clip_formats", None)
+            if converted is not None:
+                from phonyscreen import winclip
+
+                formats, size = converted
+                ok = bool(formats) and winclip.set_formats(formats, pygame.display.get_wm_info().get("window"))
+                last_clip_seqno = winclip.sequence_number()
+                logger.info("phone picture -> Windows clipboard (%d KB)%s", size // 1024, "" if ok else " FAILED")
         if resize_at and now >= resize_at and mirror is not None:
             resize_at = 0.0
             mirror.target_height = target_h
