@@ -410,6 +410,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"PyAV {av.__version__}, pygame {pygame.version.ver}"
         )
         return 0
+    if argv[:2] == ["gesturelab", "analyze"]:  # dev: summarize gesture lab recordings (no phone needed)
+        from phonyscreen.gesturelab_analyze import main as analyze_main
+
+        return analyze_main(argv[2:])
     if argv[:1] == ["pmd3"]:  # pymobiledevice3 passthrough (the .exe calls itself this way)
         from pymobiledevice3.__main__ import main as pmd3_main
 
@@ -417,7 +421,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return int(pmd3_main() or 0)
 
     parser = argparse.ArgumentParser(prog="phonyscreen", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", nargs="?", choices=["connect", "setup"], default="connect")
+    parser.add_argument("command", nargs="?", choices=["connect", "setup", "gesturelab"], default="connect")
     parser.add_argument("--usb", action="store_true", help="force USB")
     parser.add_argument("--wifi", metavar="IP", help="force Wi-Fi, trying this phone IP first")
     parser.add_argument("--version", action="version", version=f"PhonyScreen {__version__}")
@@ -437,6 +441,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         if args.command == "setup":
             return cmd_setup()
+        if args.command == "gesturelab":  # dev: connect as usual and record a gesture session
+            viewer_args = ["--lab", *viewer_args]
         return cmd_connect(args.usb, args.wifi, viewer_args)
     except Exception as e:
         if CONSOLE_HIDDEN:

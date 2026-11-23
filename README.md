@@ -33,11 +33,11 @@ PhonyScreen shows your iPhone's screen in a window on Windows and lets you use i
 3. **After that:** start PhonyScreen. It uses USB if the phone is plugged in; otherwise it finds the phone on your Wi-Fi by itself (no IP address needed).
 
 Controls:
-- **click / drag** = tap / swipe. Drags that start at the screen edge work like iPhone edge gestures: swipe up from the bottom for Home (PhonyScreen presses Home for you at the end of that swipe, since iOS doesn't act on it by itself), swipe up from the bottom and hold still a moment before letting go for the App Switcher, down from the top right for Control Center, in from the left for Back.
+- **click / drag** = tap / swipe. Drags that start at the screen edge, or on the dark frame around it, work like iPhone edge gestures (a click on the frame without dragging does nothing): swipe up from the bottom for Home (PhonyScreen presses Home for you at the end of that swipe, since iOS doesn't act on it by itself), swipe up from the bottom and hold still a moment before letting go for the App Switcher, down from the top right for Control Center, in from the left for Back.
 - **mouse wheel / touchpad** scrolls the phone while the pointer is over it; a two-finger swipe with the pointer on the phone's bottom edge goes Home; **touchpad pinch** (or Ctrl + wheel) pinch-zooms
 - **touchscreen laptops**: use your fingers directly, including two-finger pinch
 - **the bar above the phone**: drag to move the window; buttons for Home, App Switcher, rotate, passcode pad, settings, minimize, close
-- **settings** (gear button): phone size, scroll speed, pinch speed, sound on this PC, mute iPhone speaker, shared clipboard, stats. Changes are remembered.
+- **settings** (gear button): phone size, scroll speed, pinch speed, sound on this PC, mute iPhone speaker, shared clipboard, keep PhonyScreen on top, stats. Changes are remembered.
 - **locked phone**: PhonyScreen shows a blurred background with a lock; click to wake it. PhonyScreen swipes past Face ID to the passcode screen, so you can type the code on the keypad or the keyboard (**Show passcode screen** brings it back if iOS timed out)
 - **Ctrl + / Ctrl − / Ctrl 0** = bigger / smaller / default size (same as the Phone size setting; the window position is remembered too)
 - type normally, in any language: letters like ç, ş, ğ, ı, ü, ö and AltGr symbols like @ # { } work too (PhonyScreen pastes those through the phone's clipboard and puts its previous text back right after). Other **Ctrl** shortcuts go to the phone as **Cmd** shortcuts: Ctrl+C / Ctrl+V / Ctrl+A / Ctrl+Z work in phone text fields
