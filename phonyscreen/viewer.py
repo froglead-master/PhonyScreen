@@ -14,7 +14,7 @@ Standalone: needs `pymobiledevice3 remote tunneld` running, or --rsd HOST PORT.
 
 Controls (window focused):
   click / drag ........ tap / swipe (up from the bottom edge: Home; up and hold: App Switcher)
-  type ................ keyboard input (US-ASCII characters)
+  type ................ keyboard input (ç ş ğ, @ # { } ...: pasted through the phone's clipboard)
   F1 or right-click ... Home          F2 or middle-click ... Lock / wake
   F3 .................. toggle stats   F4 .................... App Switcher
   Esc ................. quit viewer
@@ -38,6 +38,7 @@ from typing import Any, Callable, Optional
 import av
 import pygame
 
+from pymobiledevice3.remote.core_device import hid_service as hs
 from pymobiledevice3.remote.core_device import vnc_server as vs
 from pymobiledevice3.remote.core_device.hevc_rps import parse_sps, remove_emulation_prevention
 from pymobiledevice3.remote.core_device.hid_service import TouchscreenContact
@@ -57,6 +58,7 @@ HOME_SWIPE_DISTANCE = 0.10  # ... and going up at least 10% of it is a Home swip
 HOME_SWIPE_PAUSE = 0.3  # ... lifted within this of the last move: Home; held still longer first: App Switcher
 HOME_BUTTON = vs._BTN_HOME
 APP_SWITCHER_GAP = 0.15  # Home pressed twice this far apart opens the App Switcher (confirmed on iOS 27.2)
+RESTORE_AFTER = 1.5  # after typing ç/ş/ğ through the phone's clipboard, put its old text back this much later
 KEYFRAME_WAIT = 1.0  # after a decode problem, wait this long for a keyframe before restarting
 NEWFRAME = pygame.USEREVENT + 1
 
@@ -72,6 +74,7 @@ MODIFIER_KEYSYMS = {
     pygame.K_LSHIFT: 0xFFE1, pygame.K_RSHIFT: 0xFFE2,
 }
 CMD_KEYSYM = 0xFFEB  # Super_L -> the iPhone's Command key
+MODIFIER_KEYS = {pygame.K_LCTRL, pygame.K_RCTRL, pygame.K_LALT, pygame.K_RALT, pygame.K_LSHIFT, pygame.K_RSHIFT, pygame.K_MODE}
 
 
 def _has_key_nal(annexb: bytes) -> bool:
@@ -221,6 +224,13 @@ class LeanMirror(vs.VncStreamServer):
         self._clip_change: Any = None  # pasteboard state last seen by pull_phone_clipboard
         self._audio_tasks: list[asyncio.Task[None]] = []
         self._clip_seq = 0
+        # Typing what the virtual keyboard can't (ç, ş, ğ, @ via AltGr, ...) goes through the phone's clipboard:
+        self._typed_texts: set[str] = set()  # texts put there to type them: never a copy on the phone
+        # The phone clipboard's real text as far as we know (from Windows, a phone copy, or at start);
+        # put back after typing. Not read back before typing: a read right after one of our writes
+        # can return stale contents.
+        self._clip_known: Optional[str] = None
+        self._clip_restore_task: Optional[asyncio.Task[None]] = None
 
     # -- decode side ---------------------------------------------------------
     def plan_scale(self, w: int, h: int) -> tuple[int, int, int, int]:
@@ -315,9 +325,15 @@ class LeanMirror(vs.VncStreamServer):
                     await self._swipe_up_from_bottom(ev[1])
                 elif ev[0] == "app_switcher":
                     await self._open_app_switcher()
+                elif ev[0] == "type_text":
+                    text = ev[1]
+                    while buf and buf[0][0] == "type_text":  # typed during the last paste: one paste
+                        text += buf.popleft()[1]
+                    await self._type_text(text)
                 elif ev[0] == "clip_to_phone":
                     if self._clipboard_monitor is not None:
                         await self._clipboard_monitor.set_text(ev[1])
+                        self._clip_known = ev[1]
                 elif ev[0] == "button":
                     page, code = ev[1]
                     await self._send_hid_button(page, code, down=True)
@@ -548,16 +564,64 @@ class LeanMirror(vs.VncStreamServer):
             change = pb._change_id(snapshot)
             if first:  # what the phone holds at start isn't a new copy
                 first, self._clip_change = False, change
+                self._clip_known = self._clip_known or content.text
                 continue
             if change == self._clip_change:
                 continue
             self._clip_change = change
             self._on_device_clipboard(content)
 
+    async def _type_text(self, text: str) -> None:
+        """Type text the virtual keyboard can't (it sends US key positions, so no ç, ş, ğ, ı, emoji,
+        and AltGr symbols depend on the phone's layout): put it on the phone's clipboard and press
+        Cmd+V. The clipboard's real text comes back once typing pauses (RESTORE_AFTER)."""
+        if self._clip_restore_task is not None and not self._clip_restore_task.done():
+            self._clip_restore_task.cancel()  # still typing: restore after the last paste
+        try:
+            self._typed_texts.add(text)
+            if len(self._typed_texts) > 500:
+                self._typed_texts = {text}
+            await self._set_phone_clipboard(text)
+            await self._ensure_keyboard()
+            assert self._uhs is not None and self._kb_service_id is not None
+            held = set(self.client.pressed_keys)  # e.g. Shift for Ç: Cmd+Shift+V would be another command
+            for keys in ({hs.KEY_LEFT_GUI}, {hs.KEY_LEFT_GUI, hs.KEY_V}, {hs.KEY_LEFT_GUI}):
+                await self._uhs.send_keyboard(self._kb_service_id, keys)
+                await asyncio.sleep(0.03)
+            await self._uhs.send_keyboard(self._kb_service_id, held)
+            logger.info("typed %d character(s) through the phone clipboard", len(text))
+        finally:
+            self._clip_restore_task = asyncio.create_task(self._restore_phone_clipboard())
+
+    async def _set_phone_clipboard(self, text: str) -> None:
+        """Put text on the phone's clipboard and wait until it's there (the monitor doesn't report
+        its own changes as copies on the phone)."""
+        monitor = self._clipboard_monitor
+        if monitor is not None:
+            await monitor.set_text(text)  # the monitor recognises its own changes
+            pending = list(monitor._set_tasks)  # SET_REPLY = the phone's clipboard holds it now
+            if pending:
+                await asyncio.wait(pending, timeout=2.0)
+        else:
+            from pymobiledevice3.remote.core_device import pasteboard_service as pb
+
+            async with pb.PasteboardService(self._rsd) as service:
+                await asyncio.wait_for(service.set_text(text), 3.0)
+
+    async def _restore_phone_clipboard(self) -> None:
+        await asyncio.sleep(RESTORE_AFTER)
+        if self._clip_known is not None:  # unknown (e.g. a picture): the typed text stays
+            with contextlib.suppress(Exception):
+                await self._set_phone_clipboard(self._clip_known)
+
     def _on_device_clipboard(self, content: Any) -> None:
         """Called by the pasteboard monitor when something is copied on the phone."""
         text = getattr(content, "text", None)
+        if text in self._typed_texts:
+            return  # put there to type it (possibly read back stale), not a copy on the phone
         logger.info("phone clipboard changed (%s)", f"{len(text)} chars of text" if text else "no text")
+        if text:
+            self._clip_known = text
         if text:
             self._clip_seq += 1
             self.phone_clip = (self._clip_seq, text)
@@ -1610,7 +1674,14 @@ def main(
                     logger.info("touchscreen swipe from the bottom edge and hold -> App Switcher")
                     mirror.post_input("app_switcher")
             elif ev.type == pygame.KEYDOWN:
-                ctrl = bool(ev.mod & pygame.KMOD_CTRL)
+                # Windows reports AltGr as Ctrl+Alt: AltGr+Q (@ on Turkish Q) is a character, not Ctrl+Q
+                altgr = bool(ev.unicode) and ev.unicode.isprintable() and bool(
+                    ev.mod & (pygame.KMOD_RALT | pygame.KMOD_MODE)
+                    or (ev.mod & pygame.KMOD_CTRL and ev.mod & pygame.KMOD_ALT)
+                )
+                ctrl = bool(ev.mod & pygame.KMOD_CTRL) and not altgr
+                if ev.mod & (pygame.KMOD_CTRL | pygame.KMOD_ALT | pygame.KMOD_MODE) and ev.key not in MODIFIER_KEYS:
+                    logger.debug("key %s mod 0x%04X altgr=%s", pygame.key.name(ev.key), ev.mod, altgr)  # not plain typing
                 if ev.key == pygame.K_ESCAPE:
                     if settings_on:
                         settings_on, redraw = False, True
@@ -1645,8 +1716,14 @@ def main(
                         keysym = MODIFIER_KEYSYMS[ev.key]
                     elif ev.key in SPECIAL_KEYSYMS:
                         keysym = SPECIAL_KEYSYMS[ev.key]
+                    elif altgr:  # @ # $ { } [ ] \ | ~ €: where they sit depends on the phone's layout
+                        mirror.post_input("type_text", ev.unicode)
+                        keysym = 0
                     elif not ctrl and ev.unicode and 0x20 <= ord(ev.unicode) <= 0x7E:
                         keysym = ord(ev.unicode)
+                    elif not ctrl and ev.unicode and ev.unicode.isprintable():
+                        mirror.post_input("type_text", ev.unicode)  # ç ş ğ ı İ ü ö ...: pasted on the phone
+                        keysym = 0
                     elif ctrl and 0x20 <= ev.key <= 0x7E:
                         # Ctrl+C / V / X / A / Z ... -> Command+key, the iPhone's shortcuts
                         if ev.key == pygame.K_v:

@@ -40,7 +40,7 @@ Controls:
 - **settings** (gear button): phone size, scroll speed, pinch speed, sound on this PC, mute iPhone speaker, shared clipboard, stats. Changes are remembered.
 - **locked phone**: PhonyScreen shows a blurred background with a lock; click to wake it. PhonyScreen swipes past Face ID to the passcode screen, so you can type the code on the keypad or the keyboard (**Show passcode screen** brings it back if iOS timed out)
 - **Ctrl + / Ctrl − / Ctrl 0** = bigger / smaller / default size (same as the Phone size setting; the window position is remembered too)
-- type normally (US-ASCII characters for now). Other **Ctrl** shortcuts go to the phone as **Cmd** shortcuts: Ctrl+C / Ctrl+V / Ctrl+A / Ctrl+Z work in phone text fields
+- type normally, in any language: letters like ç, ş, ğ, ı, ü, ö and AltGr symbols like @ # { } work too (PhonyScreen pastes those through the phone's clipboard and puts its previous text back right after). Other **Ctrl** shortcuts go to the phone as **Cmd** shortcuts: Ctrl+C / Ctrl+V / Ctrl+A / Ctrl+Z work in phone text fields
 - **F1** or right-click = Home · **F2** = Lock/wake · **F3** = stats · **F4** = App Switcher · **Esc** = quit
 
 PhonyScreen opens its own window and shows connection progress there; no console window stays open. If something misbehaves, the log is at `%APPDATA%\PhonyScreen\phonyscreen.log`.
