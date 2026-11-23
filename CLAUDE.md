@@ -29,7 +29,7 @@ Formerly named PhonePane (old repo froglead-master/PhonePane, renamed 2026-11-23
 - Locked phone keeps streaming pure black frames → `frame_is_black` → blurred last frame + "Click to wake" (privacy: blur must stay unreadable).
 - Touch: 0..65535 normalized, mainTouchscreen surface (257). Send samples ≥16 ms apart (`_paced_pointer`). iOS does NOT act on injected Home swipes from the bottom edge, so `_track_home_swipe` presses the Home button (Consumer 0x0C/0x40) at the end of such a swipe. Swipe up on the lock screen does work (used to reach the passcode screen after wake).
 - The gesture surface 1281 (19-byte rid 0x13 pointer reports) is unexplored. It might be the route to real system gestures (Home, App Switcher).
-- Audio: RTP PT 101, one raw AAC-ELD frame per packet, 480 samples, 48 kHz stereo. The phone's ASC is wrong for FFmpeg; use `F8 E6 50 00`. The phone keeps playing on its own speaker; no known option to stop that.
+- Audio: RTP PT 101, one raw AAC-ELD frame per packet, 480 samples, 48 kHz stereo. The phone's ASC is wrong for FFmpeg; use `F8 E6 50 00`. The phone keeps playing on its own speaker unless muted; we press its Mute key while PC sound plays (see Open items).
 - Windows clipboard: open it with our HWND or SetClipboardData fails after EmptyClipboard.
 - Dismissed Windows Firewall prompts create Block rules for the exe (tunnel adapter counts as Public network); launcher deletes them.
 - Wi-Fi: Bonjour was unreliable → subnet scan. Tunnel via `lockdown start-tunnel --mobdev2-host IP`.
