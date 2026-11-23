@@ -24,10 +24,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt pyinstaller pyflakes
+          python -m pip install -r requirements.txt -r requirements-dev.txt pyinstaller
 
       - name: Lint
-        run: python -m pyflakes phonyscreen phonyscreen.py
+        run: python -m pyflakes phonyscreen phonyscreen.py tests
+
+      - name: Tests
+        run: python -m pytest -q
 
       - name: Build (PyInstaller, one folder)
         run: >

@@ -47,6 +47,7 @@ from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscove
 from pymobiledevice3.tunneld.api import get_tunneld_devices
 
 from phonyscreen import appicon, phoneclip, style
+from phonyscreen import gesturelab as lab
 
 logger = logging.getLogger("phonyscreen.viewer")
 
@@ -290,6 +291,8 @@ class LeanMirror(vs.VncStreamServer):
         with self.slot_lock:
             self.frame_seq += 1
             self.slot = (data, w, h, vw, vh, t_in, self.frame_seq)
+        if lab.MOTION is not None:
+            lab.MOTION.offer(data, w, h, vw, vh, t_in, self.frame_seq)
         loop = self._loop
         if loop is not None:
             # Keeps the base class's keyframe-recovery bookkeeping and pointer
@@ -303,6 +306,8 @@ class LeanMirror(vs.VncStreamServer):
 
     # -- input side ------------------------------------------------------------
     def post_input(self, *event: Any) -> None:
+        if lab.REC is not None:
+            lab.on_post(event)
         loop = self._loop
         if loop is not None and self.input_evt is not None:
             loop.call_soon_threadsafe(self._push_input, event)
@@ -324,6 +329,8 @@ class LeanMirror(vs.VncStreamServer):
             # Coalesce drag moves: skip a move only when the next queued event is a
             # newer move, so the last position before a release is always sent.
             if ev[0] == "move" and buf and buf[0][0] == "move":
+                if lab.REC is not None:
+                    lab.on_dequeue(ev, True)
                 continue
             # Same for multi-finger moves: skip if the next report has the same fingers, all still down.
             if (
@@ -334,7 +341,11 @@ class LeanMirror(vs.VncStreamServer):
                 and all(c[3] for c in buf[0][1])
                 and [c[0] for c in ev[1]] == [c[0] for c in buf[0][1]]
             ):
+                if lab.REC is not None:
+                    lab.on_dequeue(ev, True)
                 continue
+            if lab.REC is not None:
+                lab.on_dequeue(ev, False)
             try:
                 if ev[0] in ("move", "pointer"):
                     await self._paced_pointer(ev[1], ev[2], ev[3])
@@ -385,13 +396,28 @@ class LeanMirror(vs.VncStreamServer):
             for i in range(1, n):
                 await self._wait_until(lt + TOUCH_INTERVAL)
                 xi, yi = round(lx + (x - lx) * i / n), round(ly + (y - ly) * i / n)
+                self._lab_interp = True
                 await self._handle_pointer(self.client, mask | 1, xi, yi)
+                self._lab_interp = False
                 lt = time.perf_counter()
             await self._wait_until(lt + TOUCH_INTERVAL)
         was_pressed = self.client.pressed
         await self._handle_pointer(self.client, mask, x, y)
         self._touch_last = (x, y, time.perf_counter()) if mask & 1 else None
         await self._track_home_swipe(mask, x, y, was_pressed)
+
+    _lab_interp = False  # the next _handle_pointer is a filled-in sample (gesture lab)
+
+    async def _handle_pointer(self, client: Any, button_mask: int, x: int, y: int) -> None:
+        if lab.REC is not None:
+            lab.rec("touch", x=x, y=y, m=button_mask, was=client.pressed, interp=self._lab_interp,
+                    fb=(self._fb_width, self._fb_height))
+        await super()._handle_pointer(client, button_mask, x, y)
+
+    async def _send_hid_button(self, page: int, code: int, *, down: bool) -> None:
+        if lab.REC is not None:
+            lab.rec("hid_button", page=page, code=code, down=down)
+        await super()._send_hid_button(page, code, down=down)
 
     async def _swipe_up_from_bottom(self, delay: float) -> None:
         """A finger-paced swipe up from the bottom edge (opens the passcode screen from the lock screen)."""
@@ -426,6 +452,8 @@ class LeanMirror(vs.VncStreamServer):
         now = time.perf_counter()
         if mask & 1 and not was_pressed:
             self._swipe = [y / h, y / h, now, now, y]  # start v, min v, start t, last move t, last y
+            if lab.REC is not None and y / h >= 1.0 - HOME_SWIPE_EDGE:
+                lab.rec("decide", what="home_swipe_candidate", y=y, h=h)
             return
         sw = getattr(self, "_swipe", None)
         if sw is None:
@@ -437,14 +465,19 @@ class LeanMirror(vs.VncStreamServer):
             return
         self._swipe = None
         start_v, end_v = sw[0], y / h
+        if lab.REC is not None and start_v >= 1.0 - HOME_SWIPE_EDGE:
+            lab.rec("decide", what="home_swipe_end", start_v=round(start_v, 4), end_v=round(end_v, 4),
+                    held=round(now - sw[3], 3), dur=round(now - sw[2], 3))
         if not (was_pressed and start_v >= 1.0 - HOME_SWIPE_EDGE and start_v - end_v >= HOME_SWIPE_DISTANCE):
             return
         if now - sw[3] > HOME_SWIPE_PAUSE:
             logger.info("bottom-edge swipe up and hold -> App Switcher")
+            lab.rec("decide", what="app_switcher", src="pointer")
             await asyncio.sleep(0.12)
             await self._open_app_switcher()
         elif now - sw[2] <= 1.5:
             logger.info("bottom-edge swipe up -> Home")
+            lab.rec("decide", what="home", src="pointer")
             await asyncio.sleep(0.12)
             await self._send_hid_button(*HOME_BUTTON, down=True)
             await asyncio.sleep(0.05)
@@ -462,6 +495,8 @@ class LeanMirror(vs.VncStreamServer):
             return
         await self._ensure_hid()
         assert self._uhs is not None and self._touch_service_id is not None
+        if lab.REC is not None:
+            lab.rec("multi", c=contacts, fb=(self._fb_width, self._fb_height))
         out = []
         for ident, x, y, touching in contacts[:5]:
             u, v = vs.framebuffer_to_display(x, y, self._fb_width, self._fb_height, self._fb_rotation)
@@ -855,6 +890,11 @@ BAR_H = 30  # floating pill bar above the phone
 BAR_GAP = 6
 CORNER_FRACTION = 0.135  # iPhone screen corner radius as a fraction of its short side
 EDGE_MARGIN = 0.03  # touches starting this close to an edge snap to it (fraction of size)
+BEZEL_FRACTION = 0.035  # dark frame around the screen, as a fraction of its short side ...
+BEZEL_MIN, BEZEL_MAX = 12, 20  # ... in pixels
+BEZEL_DRAG = 6  # a press on the frame becomes a touch at the nearest screen edge once it moves this far
+BEZEL_COLOR = (12, 12, 14)
+BEZEL_BAND = (64, 64, 70)  # thin outer edge, like a phone's metal band
 # The locked-phone view follows the phone's own backlight state when it reports one (LeanMirror.backlight).
 # The stream pauses for a few seconds now and then while the phone is in use, so missing video alone
 # isn't "locked":
@@ -863,7 +903,10 @@ IDLE_SECONDS = 5.0  # backlight unknown: no video this long -> locked-phone view
 BLACK_SECONDS = 2.0  # backlight unknown: only pure-black frames this long -> screen off -> locked-phone view
 DARK_LEVEL = 14  # average byte value below which a frame counts as "screen off"
 PILL_LEFT = ("home", "switcher", "rotate", "keypad", "settings")
-DEFAULT_SETTINGS = {"size": 0.70, "scroll": 0.45, "pinch_speed": 0.5, "sound": True, "mute_phone": True, "clipboard": True, "stats": False}
+DEFAULT_SETTINGS = {
+    "size": 0.70, "scroll": 0.45, "pinch_speed": 0.5, "sound": True, "mute_phone": True, "clipboard": True,
+    "on_top": False, "stats": False,
+}
 SETTING_ROWS = (  # (key, label, kind, min, max, step)
     ("size", "Phone size", "pct", 0.35, 0.95, 0.05),
     ("scroll", "Scroll speed", "pct", 0.0, 1.0, 0.05),
@@ -871,6 +914,7 @@ SETTING_ROWS = (  # (key, label, kind, min, max, step)
     ("sound", "Sound on this PC", "bool", 0, 0, 0),
     ("mute_phone", "Mute iPhone speaker", "bool", 0, 0, 0),
     ("clipboard", "Share clipboard", "bool", 0, 0, 0),
+    ("on_top", "Keep PhonyScreen on top", "bool", 0, 0, 0),
     ("stats", "Show stats", "bool", 0, 0, 0),
 )
 PILL_RIGHT = ("minimize", "close")
@@ -897,10 +941,81 @@ def pill_buttons(win_w: int) -> dict[str, pygame.Rect]:
 
 
 
+def bezel_width(w: int, h: int) -> int:
+    """The frame around a w x h phone picture: 12..20 px, growing with the phone."""
+    return max(BEZEL_MIN, min(BEZEL_MAX, round(min(w, h) * BEZEL_FRACTION)))
+
+
+def screen_radius(w: int, h: int) -> float:
+    return max(4.0, min(w, h) * CORNER_FRACTION)
+
+
+def window_to_picture(pos: tuple[int, int], disp: tuple[int, int], bezel: int) -> tuple[int, int]:
+    """Window position -> phone-picture pixels, clamped to the screen: a point on the frame maps to
+    the nearest screen edge (a corner of the frame to the screen's corner)."""
+    x = max(0, min(disp[0] - 1, pos[0] - bezel))
+    y = max(0, min(disp[1] - 1, pos[1] - phone_origin_y() - bezel))
+    return x, y
+
+
+def on_bezel(pos: tuple[int, int], disp: tuple[int, int], bezel: int) -> bool:
+    """On the frame around the screen (window coordinates)?"""
+    y0 = phone_origin_y()
+    outer = pygame.Rect(0, y0, disp[0] + 2 * bezel, disp[1] + 2 * bezel)
+    return outer.collidepoint(pos) and not pygame.Rect(bezel, y0 + bezel, *disp).collidepoint(pos)
+
+
+class BezelDrag:
+    """A press on the frame waits. Moved BEZEL_DRAG px, it becomes a touch that starts at the nearest
+    screen edge (where iOS starts Home, Back, Notification and Control Center); let go before that,
+    it was a tap on the frame and does nothing. Keyed by "mouse" or a touchscreen finger id."""
+
+    def __init__(self) -> None:
+        self.pending: dict[Any, tuple[tuple[int, int], tuple[int, int]]] = {}  # key -> (press pos, edge point)
+
+    def press(self, key: Any, pos: tuple[int, int], edge: tuple[int, int]) -> None:
+        self.pending[key] = (pos, edge)
+        lab.rec("decide", what="bezel_press", key=key, pos=pos, edge=edge)
+
+    def move(self, key: Any, pos: tuple[int, int]) -> Optional[tuple[int, int]]:
+        """The edge point where the touch starts, once the press has moved far enough; else None."""
+        p = self.pending.get(key)
+        if p is None or max(abs(pos[0] - p[0][0]), abs(pos[1] - p[0][1])) < BEZEL_DRAG:
+            return None
+        del self.pending[key]
+        lab.rec("decide", what="bezel_drag_start", key=key, edge=p[1])
+        return p[1]
+
+    def release(self, key: Any) -> bool:
+        """True if this was a pending press (a tap on the frame: ignore it)."""
+        if self.pending.pop(key, None) is None:
+            return False
+        lab.rec("decide", what="bezel_tap_ignored", key=key)
+        return True
+
+    def waiting(self, key: Any) -> bool:
+        return key in self.pending
+
+
+def draw_bezel(screen: pygame.Surface, y0: int, w: int, h: int, b: int) -> None:
+    """The phone frame, drawn over the picture's square corners; the window shape is its outline."""
+
+    def build(s: pygame.Surface) -> None:
+        ow, oh, r = w + 2 * b, h + 2 * b, screen_radius(w, h)
+        s.fill((0, 0, 0, 255))  # outside the curve: the window shape cuts it away; dark at its jagged edge
+        s.blit(style.round_rect(ow, oh, r + b, BEZEL_COLOR), (0, 0))
+        s.blit(style.round_rect(ow, oh, r + b, BEZEL_BAND, 1.5), (0, 0))
+        # cut the screen out: subtracting an opaque shape leaves alpha 0 there (soft at the curve)
+        s.blit(style.round_rect(w, h, r, (0, 0, 0)), (b, b), special_flags=pygame.BLEND_RGBA_SUB)
+
+    screen.blit(cached_overlay(("bezel", w, h, b), w + 2 * b, h + 2 * b, build), (0, y0))
+
+
 def snap_to_edges(x: int, y: int, w: int, h: int) -> tuple[int, int]:
     """iOS starts system gestures (Home, Control Center, back) only from the very edge."""
     mx = max(6, round(w * EDGE_MARGIN))
     my = max(6, round(h * EDGE_MARGIN * 0.6))
+    x0, y0 = x, y
     if x < mx:
         x = 0
     elif x > w - 1 - mx:
@@ -909,6 +1024,8 @@ def snap_to_edges(x: int, y: int, w: int, h: int) -> tuple[int, int]:
         y = 0
     elif y > h - 1 - my:
         y = h - 1
+    if lab.REC is not None and (x, y) != (x0, y0):
+        lab.rec("decide", what="edge_snap", frm=(x0, y0), to=(x, y), size=(w, h))
     return x, y
 
 
@@ -1091,6 +1208,7 @@ class ScrollGesture:
             # two fingers swiping with the pointer on the bottom edge: like swiping up from the
             # phone's bottom edge. Whichever way Windows maps the scroll direction, it means Home.
             self.active, self.home = True, [0.0, 0.0, False]
+            lab.rec("decide", what="scroll_home_start", start=start)
         if self.home is not None:
             self.last = now
             if self.home[2]:
@@ -1101,18 +1219,21 @@ class ScrollGesture:
                 self.home[2] = True
                 self.home_quiet_until = now + 1.0
                 logger.info("touchpad swipe from the bottom edge -> Home")
+                lab.rec("decide", what="home", src="wheel")
                 return [("button", HOME_BUTTON)]
             return []  # no touches while it's a Home swipe
         if not self.active:
             x = min(max(start[0], mx), w - 1 - mx)
             y = min(max(start[1], my), h - 1 - my)
             self.pos, self.active = (float(x), float(y)), True
+            lab.rec("decide", what="scroll_start", start=start, at=(x, y), margin=(mx, my))
             events.append(("pointer", 1, x, y))
         nx, ny = self.pos[0] + dx, self.pos[1] + dy
         if not (mx <= nx <= w - 1 - mx and my <= ny <= h - 1 - my):
             # reached the edge of the screen: lift, and the next tick starts a new drag
             events.append(("pointer", 0, int(self.pos[0]), int(self.pos[1])))
             self.active = False
+            lab.rec("decide", what="scroll_edge_lift", at=self.pos, wanted=(nx, ny))
             return events
         self.pos, self.last = (nx, ny), now
         events.append(("move", 1, int(nx), int(ny)))
@@ -1123,7 +1244,9 @@ class ScrollGesture:
             self.active = False
             if self.home is not None:
                 self.home = None
+                lab.rec("decide", what="scroll_home_end")
                 return []
+            lab.rec("decide", what="scroll_release", at=self.pos, quiet=round(now - self.last, 3))
             return [("pointer", 0, int(self.pos[0]), int(self.pos[1]))]
         return []
 
@@ -1154,6 +1277,7 @@ class PinchGesture:
             half = self.limits[1] / 2 + 2
             self.center = (int(min(max(center[0], half), w - 1 - half)), int(min(max(center[1], 30), h - 31)))
             self.active = True
+            lab.rec("decide", what="pinch_start", center=self.center, wanted=center, dist=self.dist)
         self.dist = min(max(self.dist * (1.12 ** amount), self.limits[0]), self.limits[1])
         self.last = now
         return [("multi", self._contacts(True))]
@@ -1161,6 +1285,7 @@ class PinchGesture:
     def tick(self, now: float) -> list[tuple]:
         if self.active and now - self.last > self.RELEASE_AFTER:
             self.active = False
+            lab.rec("decide", what="pinch_end", dist=self.dist)
             return [("multi", self._contacts(False))]
         return []
 
@@ -1218,8 +1343,9 @@ class FingerTracker:
         return [(i, x, y, True) for i, x, y in self.contacts.values()]
 
 
-def apply_window_shape(win_w: int, phone_w: int, phone_h: int) -> None:
-    """Rounded, iPhone-shaped window plus the floating pill (Windows only)."""
+def apply_window_shape(win_w: int, phone_w: int, phone_h: int, panel_w: int = 0, bezel: int = 0) -> None:
+    """Rounded, iPhone-shaped window (screen plus its ``bezel``) and the floating pill (Windows only);
+    ``panel_w``: the gesture lab's panel to the right of the phone."""
     if sys.platform != "win32":
         return
     with contextlib.suppress(Exception):
@@ -1228,13 +1354,29 @@ def apply_window_shape(win_w: int, phone_w: int, phone_h: int) -> None:
         hwnd = pygame.display.get_wm_info()["window"]
         gdi32, user32 = ctypes.windll.gdi32, ctypes.windll.user32
         y0 = phone_origin_y()
-        d = max(8, int(min(phone_w, phone_h) * CORNER_FRACTION * 2))
-        phone = gdi32.CreateRoundRectRgn(0, y0, phone_w + 1, y0 + phone_h + 1, d, d)
-        pr = pill_rect(win_w)
+        d = max(8, int(2 * (screen_radius(phone_w, phone_h) + bezel)))
+        ow, oh = phone_w + 2 * bezel, phone_h + 2 * bezel
+        phone = gdi32.CreateRoundRectRgn(0, y0, ow + 1, y0 + oh + 1, d, d)
+        pr = pill_rect(win_w - panel_w)
         pill = gdi32.CreateRoundRectRgn(pr.left, pr.top, pr.right + 1, pr.bottom + 1, BAR_H, BAR_H)
         gdi32.CombineRgn(phone, phone, pill, 2)  # RGN_OR
         gdi32.DeleteObject(pill)
+        if panel_w:
+            panel = gdi32.CreateRoundRectRgn(ow + 10, y0, ow + panel_w + 1, y0 + oh + 1, 52, 52)
+            gdi32.CombineRgn(phone, phone, panel, 2)
+            gdi32.DeleteObject(panel)
         user32.SetWindowRgn(hwnd, phone, True)  # Windows now owns the region
+
+
+def set_always_on_top(on: bool) -> None:
+    if sys.platform != "win32":
+        return
+    with contextlib.suppress(Exception):
+        import ctypes
+
+        hwnd = pygame.display.get_wm_info()["window"]
+        # HWND_TOPMOST / HWND_NOTOPMOST; SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+        ctypes.windll.user32.SetWindowPos(hwnd, -1 if on else -2, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0010)
 
 
 def start_window_drag() -> None:
@@ -1412,6 +1554,9 @@ def main(
     )
     parser.add_argument("--stats", action="store_true", help="show the stats overlay at start (F3 toggles)")
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--lab", action="store_true", help=argparse.SUPPRESS)  # gesture lab (launcher: gesturelab)
+    parser.add_argument("--lab-tasks", help=argparse.SUPPRESS)
+    parser.add_argument("--lab-repeat", type=int, default=3, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     handlers: list[logging.Handler] = [logging.StreamHandler()]
     with contextlib.suppress(Exception):  # a log file to look at when something misbehaves
@@ -1450,12 +1595,17 @@ def main(
     target_h = args.height or int((screen_h - y0) * float(settings["size"]))
     target_h = min(max(target_h, 400), max_h)
     placeholder = (int(target_h * 0.46), target_h)
-    win_size = (placeholder[0], y0 + placeholder[1])
+    lab_tasks = args.lab_tasks.split(",") if args.lab_tasks else None
+    lab_session = lab.start(lab_tasks, args.lab_repeat, settings) if args.lab else None
+    lab_w = lab.PANEL_W if lab_session is not None else 0
+    bz = bezel_width(*placeholder)  # the frame around the screen; the picture sits at (bz, y0 + bz)
+    win_size = (placeholder[0] + 2 * bz + lab_w, y0 + placeholder[1] + 2 * bz)
     screen = pygame.display.set_mode(win_size, pygame.NOFRAME)
-    pygame.display.set_caption("PhonyScreen")
+    pygame.display.set_caption("PhonyScreen gesture lab" if lab_session else "PhonyScreen")
     with contextlib.suppress(Exception):
         pygame.display.set_icon(app_icon(64))
-    apply_window_shape(win_size[0], *placeholder)
+    apply_window_shape(win_size[0], *placeholder, lab_w, bz)
+    set_always_on_top(bool(settings["on_top"]))
 
     box: dict[str, Any] = {"status": "Connecting..."}
     ready = threading.Event()
@@ -1486,27 +1636,31 @@ def main(
     keypad_digits = 0
     resize_at = 0.0
     scroll, pinch, fingers = ScrollGesture(), PinchGesture(), FingerTracker()
+    bezel = BezelDrag()  # presses on the frame around the screen
 
     def to_fb(pos: tuple[int, int], snap: bool = False) -> tuple[int, int]:
-        x = max(0, min(disp[0] - 1, pos[0]))
-        y = max(0, min(disp[1] - 1, pos[1] - y0))
+        x, y = window_to_picture(pos, disp, bz)
         if snap:
             x, y = snap_to_edges(x, y, disp[0], disp[1])
         return x, y
 
     def pill_hit(pos: tuple[int, int]) -> Optional[str]:
-        if pos[1] >= BAR_H or not pill_rect(win_size[0]).collidepoint(pos):
+        if pos[1] >= BAR_H or not pill_rect(win_size[0] - lab_w).collidepoint(pos):
             return None
-        for name, r in pill_buttons(win_size[0]).items():
+        for name, r in pill_buttons(win_size[0] - lab_w).items():
             if r.collidepoint(pos):
                 return name
         return "drag"
+
+    def in_phone(pos: tuple[int, int]) -> bool:
+        """Over the phone (screen or frame), not the gesture lab's panel beside it?"""
+        return pos[0] < disp[0] + 2 * bz
 
     def keypad_hit(pos: tuple[int, int]) -> Optional[str]:
         if not keypad_on:
             return None
         panel, keys = keypad_layout(*disp)
-        p = (pos[0], pos[1] - y0)
+        p = (pos[0] - bz, pos[1] - y0 - bz)
         for label, r in keys.items():
             if r.collidepoint(p):
                 return label
@@ -1540,6 +1694,7 @@ def main(
         busy = scroll.active or pinch.active or resize_at or (box.get("mirror") and box["mirror"].phone_clip
                                                                 and box["mirror"].phone_clip[0] != last_clip_seq)
         busy = busy or (not got_picture and "error" not in box)  # keep the spinner turning
+        busy = busy or (lab_session is not None and lab_session.busy())
         events = [pygame.event.wait(30 if busy else 250)]
         events += pygame.event.get()
         now = time.perf_counter()
@@ -1621,7 +1776,7 @@ def main(
             """Handle a click while the settings panel is open; True if it was consumed."""
             nonlocal settings_on, show_stats, target_h, resize_at
             panel, hits = settings_layout(*disp)
-            p = (pos[0], pos[1] - y0)
+            p = (pos[0] - bz, pos[1] - y0 - bz)
             for hit, r in hits.items():
                 if r.collidepoint(p):
                     if hit == "done":
@@ -1635,6 +1790,8 @@ def main(
                             mirror.set_sound(bool(settings["sound"]))
                         if hit == "mute_phone" and mirror is not None:
                             mirror.set_mute_phone(bool(settings["mute_phone"]))
+                        if hit == "on_top":
+                            set_always_on_top(bool(settings["on_top"]))
                         update_config(settings=settings)
                     return True
             if not panel.collidepoint(p):
@@ -1660,7 +1817,11 @@ def main(
             elif hit == "drag":
                 start_window_drag()
 
+        if lab.REC is not None:
+            lab.REC.paused = keypad_on  # never record passcode taps
         for ev in events:
+            if lab.REC is not None:
+                lab.record_event(ev, to_fb, win_size)
             if ev.type == pygame.QUIT:
                 running = False
             elif ev.type == NEWFRAME:
@@ -1677,12 +1838,16 @@ def main(
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and pill_hit(ev.pos):
                 pill_action(pill_hit(ev.pos))  # type: ignore[arg-type]
                 redraw = True
-            elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button in (1, 2, 3) and ev.pos[1] >= y0:
+            elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button in (1, 2, 3) and ev.pos[1] >= y0 and in_phone(ev.pos):
                 if settings_on:
                     settings_click(ev.pos)
                     redraw = True
                     continue
                 if mirror is None:
+                    continue
+                if on_bezel(ev.pos, disp, bz):
+                    if ev.button == 1 and not idle and not touch_down:
+                        bezel.press("mouse", ev.pos, to_fb(ev.pos))
                     continue
                 k = keypad_hit(ev.pos) if ev.button == 1 else None
                 if k:
@@ -1699,6 +1864,8 @@ def main(
                 mouse_mask |= {1: 1, 2: 2, 3: 4}[ev.button]
                 touch_down = touch_down or ev.button == 1
                 mirror.post_input("pointer", mouse_mask, *to_fb(ev.pos, snap=ev.button == 1))
+            elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1 and bezel.release("mouse"):
+                pass  # a tap on the frame: nothing
             elif ev.type == pygame.MOUSEBUTTONUP and ev.button in (1, 2, 3):
                 bit = {1: 1, 2: 2, 3: 4}[ev.button]
                 if mirror is None or not mouse_mask & bit:
@@ -1708,18 +1875,29 @@ def main(
                     touch_down = False
                 mirror.post_input("pointer", mouse_mask, *to_fb(ev.pos))
             elif ev.type == pygame.MOUSEMOTION:
-                if touch_down and mirror is not None:
+                if bezel.waiting("mouse") and mirror is not None:
+                    edge = bezel.move("mouse", ev.pos) if ev.buttons[0] else None
+                    if not ev.buttons[0]:
+                        bezel.release("mouse")  # let go outside the window
+                    elif edge is not None:
+                        mouse_mask |= 1
+                        touch_down = True
+                        mirror.post_input("pointer", mouse_mask, *edge)
+                        mirror.post_input("move", mouse_mask, *to_fb(ev.pos))
+                elif touch_down and mirror is not None:
                     mirror.post_input("move", mouse_mask, *to_fb(ev.pos))
                 new_hover = pill_hit(ev.pos)
                 if new_hover != hover:
                     hover, redraw = new_hover, True
             elif ev.type == pygame.MOUSEWHEEL:
                 mpos = pygame.mouse.get_pos()
-                if mirror is None or touch_down or mpos[1] < y0 or idle or settings_on:
+                if mirror is None or touch_down or mpos[1] < y0 or not in_phone(mpos) or idle or settings_on:
                     continue
                 sign = -1 if getattr(ev, "flipped", False) else 1
                 py = float(getattr(ev, "precise_y", ev.y)) * sign
                 px = float(getattr(ev, "precise_x", ev.x)) * sign
+                if lab.REC is not None:
+                    lab.rec("wheel_used", px=px, py=py, step=round(disp[1] * 0.06 * scroll_factor(settings), 3))
                 if pygame.key.get_mods() & pygame.KMOD_CTRL:  # touchpad pinch arrives as Ctrl+wheel
                     for e in pinch.feed(to_fb(mpos), py, disp[0], disp[1], now, speed=settings["pinch_speed"]):
                         mirror.post_input(*e)
@@ -1750,23 +1928,39 @@ def main(
                         wake()
                         redraw = True
                         continue
-                    if wy < y0:
+                    if wy < y0 or not in_phone((wx, wy)):
+                        continue
+                    if on_bezel((wx, wy), disp, bz):
+                        bezel.press(ev.finger_id, (wx, wy), to_fb((wx, wy)))
                         continue
                     report = fingers.down(ev.finger_id, *to_fb((wx, wy)), disp[0], disp[1])
                 elif ev.type == pygame.FINGERMOTION:
+                    if bezel.waiting(ev.finger_id):
+                        edge = bezel.move(ev.finger_id, (wx, wy))
+                        if edge is None:
+                            continue
+                        report = fingers.down(ev.finger_id, *edge, disp[0], disp[1])
+                        if report is not None:
+                            mirror.post_input("multi", report)
                     report = fingers.move(ev.finger_id, *to_fb((wx, wy)))
                 else:
+                    if bezel.release(ev.finger_id):
+                        continue  # a tap on the frame: nothing
                     report = fingers.up(ev.finger_id)
                 if report is not None:
                     mirror.post_input("multi", report)
                 if fingers.home_swipe:  # iOS ignores the injected edge swipe, so press Home for it
                     fingers.home_swipe = False
                     logger.info("touchscreen swipe from the bottom edge -> Home")
+                    lab.rec("decide", what="home", src="touch")
                     mirror.post_input("button", HOME_BUTTON)
                 if fingers.app_switcher:
                     fingers.app_switcher = False
                     logger.info("touchscreen swipe from the bottom edge and hold -> App Switcher")
+                    lab.rec("decide", what="app_switcher", src="touch")
                     mirror.post_input("app_switcher")
+            elif ev.type == pygame.KEYDOWN and lab_session is not None and lab_session.key(ev):
+                redraw = True  # Space / 1-3 / Backspace / Tab drive the gesture lab
             elif ev.type == pygame.KEYDOWN:
                 # Windows reports AltGr as Ctrl+Alt: AltGr+Q (@ on Turkish Q) is a character, not Ctrl+Q
                 altgr = bool(ev.unicode) and ev.unicode.isprintable() and bool(
@@ -1881,6 +2075,8 @@ def main(
         rot = ((getattr(mirror, "_rotation", 0) if mirror is not None else 0) + rot_manual) % 360
         if rot != rot_shown:
             redraw = True
+        if lab_session is not None and lab_session.busy():
+            redraw = True  # the recording timer
         status = mirror.status if mirror is not None and "error" not in box else box.get("status", "")
         if idle:
             status = ""  # the locked view explains it
@@ -1917,34 +2113,43 @@ def main(
                 signed = -90 if rot == 270 else rot
                 mirror.display_map = (disp[0], disp[1], signed)  # type: ignore[union-attr]
                 mirror._fb_width, mirror._fb_height, mirror._fb_rotation = disp[0], disp[1], signed  # type: ignore[union-attr]
-                new_size = (disp[0], y0 + disp[1])
+                bz = bezel_width(*disp)
+                new_size = (disp[0] + 2 * bz + lab_w, y0 + disp[1] + 2 * bz)
                 if new_size != win_size:
                     win_size = new_size
                     screen = pygame.display.set_mode(win_size, pygame.NOFRAME)
-                apply_window_shape(win_size[0], *disp)
+                apply_window_shape(win_size[0], *disp, lab_w, bz)
+                set_always_on_top(bool(settings["on_top"]))
+                if lab.REC is not None:
+                    lab.rec("display", disp=disp, rot=rot, win=win_size, bezel=bz, dpi=lab.window_dpi(),
+                            phone=getattr(mirror, "_display_size", None))
         screen.fill((0, 0, 0))
+        view = screen.subsurface(pygame.Rect(bz, bz, disp[0], y0 + disp[1]))
         if picture is not None and idle:
             key = (show[6], disp, rot_shown)  # type: ignore[index]
             if blur_cache.get("key") != key:
                 blur_cache.update(key=key, surf=privacy_blur(picture))
-            screen.blit(blur_cache["surf"], (0, y0))
+            view.blit(blur_cache["surf"], (0, y0))
         elif picture is not None:
-            screen.blit(picture, (0, y0))
+            view.blit(picture, (0, y0))
         else:  # no video yet: app name and progress, or why it couldn't connect
-            draw_connecting(screen, y0, win_size[0], win_size[1] - y0, status, "error" in box, now, body=not idle)
+            draw_connecting(view, y0, disp[0], disp[1], status, "error" in box, now, body=not idle)
         got_picture = got_picture or picture is not None
-        draw_pill(screen, win_size[0], hover, keypad_on, settings_on)
         if idle and not keypad_on:
             title = "Waiting for your iPhone" if stream_stopped and not screen_off else "iPhone is locked"
-            draw_locked(screen, y0, disp[0], disp[1], title)
+            draw_locked(view, y0, disp[0], disp[1], title)
         if keypad_on and picture is not None:
-            draw_keypad(screen, y0, disp[0], disp[1])
+            draw_keypad(view, y0, disp[0], disp[1])
         if settings_on:
-            draw_settings(screen, y0, disp[0], disp[1], settings)
+            draw_settings(view, y0, disp[0], disp[1], settings)
+        draw_bezel(screen, y0, disp[0], disp[1], bz)  # also rounds off the corners of what's under it
+        draw_pill(screen, win_size[0] - lab_w, hover, keypad_on, settings_on)
+        if lab_session is not None:
+            lab_session.draw(screen, win_size[0] - lab_w + 10, y0, win_size[1] - y0)
 
         lines: list[str] = []
         if status and picture is not None:  # without a picture, the connecting screen shows it
-            lines.extend(style.wrap(status, max(13, disp[1] // 66), win_size[0] - 64))
+            lines.extend(style.wrap(status, max(13, disp[1] // 66), disp[0] - 64))
         if show_stats and mirror is not None:
             st = mirror.stats
             with st.lock:
@@ -1957,7 +2162,7 @@ def main(
         y = y0 + max(44, int(disp[1] * 0.065))  # below the rounded corners and the camera cut-out
         for line in lines:
             img = style.toast(line, max(13, disp[1] // 66))
-            screen.blit(img, ((win_size[0] - img.get_width()) // 2, y))
+            view.blit(img, ((disp[0] - img.get_width()) // 2, y))
             y += img.get_height() + 6
         pygame.display.flip()
 
@@ -1968,6 +2173,7 @@ def main(
     if mirror is not None:
         mirror.request_stop()
     backend.join(timeout=8.0)  # let the backend release the device's media session
+    lab.stop()
     pygame.quit()
     return 0
 
