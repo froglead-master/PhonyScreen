@@ -1,0 +1,82 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # to attach the zip to a GitHub Release on version tags
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          architecture: x64  # runs natively on x64 and under emulation on Windows on Arm
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller pyflakes
+
+      - name: Lint
+        run: python -m pyflakes phonyscreen phonyscreen.py
+
+      - name: Build (PyInstaller, one folder)
+        run: >
+          pyinstaller --noconfirm --clean --onedir --console --name PhonyScreen --icon assets/phonyscreen.ico
+          --collect-all pymobiledevice3
+          --collect-all pytun_pmd3
+          --collect-all developer_disk_image
+          --collect-all pygame
+          --collect-all av
+          --collect-all sounddevice
+          --collect-all _sounddevice_data
+          --recursive-copy-metadata pymobiledevice3
+          --hidden-import phonyscreen.viewer
+          phonyscreen.py
+
+      - name: Smoke test the build
+        shell: pwsh
+        run: |
+          $exe = "dist\PhonyScreen\PhonyScreen.exe"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "--version failed" }
+          & $exe pmd3 version
+          if ($LASTEXITCODE -ne 0) { throw "pymobiledevice3 passthrough failed" }
+          & $exe selftest
+          if ($LASTEXITCODE -ne 0) { throw "selftest failed (viewer, PyAV or pygame missing from the build)" }
+          & $exe pmd3 mounter --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mounter command failed to load" }
+          & $exe pmd3 lockdown start-tunnel --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "tunnel command failed to load" }
+          & $exe pmd3 remote tunneld --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "tunneld command failed to load" }
+          & $exe pmd3 usbmux list
+          Write-Host "usbmux list exit code: $LASTEXITCODE (no device on CI, so a failure here is expected)"
+          exit 0
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          Copy-Item README.md, LICENSE dist\PhonyScreen\
+          Compress-Archive -Path dist\PhonyScreen -DestinationPath PhonyScreen-windows.zip
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: PhonyScreen-windows
+          path: PhonyScreen-windows.zip
+
+      - name: Attach to release (version tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: PhonyScreen-windows.zip
+          generate_release_notes: true
