@@ -130,6 +130,8 @@ class LeanDecoder:
     def feed(self, annexb: bytes) -> None:
         now = time.perf_counter()
         srv = self._server
+        if now - srv.last_feed_t > 1.0:
+            srv.feed_since = now  # data resumed after a pause: "no picture" counts from here
         srv.last_feed_t = now
         if srv.dirty_since and _has_key_nal(annexb):
             srv.dirty_since = 0.0  # a full frame arrived: references are clean again
@@ -201,6 +203,8 @@ class LeanMirror(vs.VncStreamServer):
             self._clipboard_monitor._allow_full_pull = True
         self.target_height = target_height
         self.last_frame_t = time.perf_counter()  # last picture handed to the window
+        self.feed_since = self.last_frame_t  # when video data last started flowing after a pause
+        self.backlight: Optional[str] = None  # the phone's screen state, once known (see _apply_display)
         self.stats = Stats()
         self.last_feed_t = time.perf_counter()
         self.slot: Optional[tuple[bytes, int, int, int, int, float, int]] = None
@@ -255,6 +259,16 @@ class LeanMirror(vs.VncStreamServer):
 
     def _new_transcoder(self, vps: bytes, sps: bytes, pps: bytes) -> Any:
         return LeanDecoder(self, vps, sps, pps)
+
+    def _apply_display(self, display: dict[str, Any]) -> bool:
+        """Also note the screen's backlight: "activeOn", "activeDimmed" (idle, before auto-lock),
+        "inactiveOn" (always-on lock screen) or "off". The display monitor sees every change within
+        ~1 s; the window's locked view follows it."""
+        light = display.get("backlightState", self.backlight)
+        if light != self.backlight:
+            logger.info("phone screen: %s", light)
+            self.backlight = light
+        return super()._apply_display(display)
 
     def _fire_decoder_refresh(self, now: float, *, reason: str) -> None:
         """Replaces the base behaviour, which PAUSES decoding until the phone answers a
@@ -695,7 +709,9 @@ class LeanMirror(vs.VncStreamServer):
             # 3) Data keeps coming but no picture comes out (e.g. packets lost while a big
             #    clipboard picture crossed the tunnel, and decoding never resynced). Check 1
             #    misses it once a keyframe *arrives*, check 2 because data arrives.
-            frozen = now - self.last_frame_t
+            #    Counted from when data resumed: after a normal pause the first new picture
+            #    takes a moment, and the picture before the pause is old by then.
+            frozen = now - max(self.last_frame_t, self.feed_since)
             if idle < 1.0 and frozen > FROZEN_SECONDS and now - self.restart_t >= max(FROZEN_SECONDS, backoff):
                 await self._restart_stream(f"video data but no picture for {frozen:.1f}s")
                 backoff = min(backoff * 2, 30.0)
@@ -839,8 +855,12 @@ BAR_H = 30  # floating pill bar above the phone
 BAR_GAP = 6
 CORNER_FRACTION = 0.135  # iPhone screen corner radius as a fraction of its short side
 EDGE_MARGIN = 0.03  # touches starting this close to an edge snap to it (fraction of size)
-IDLE_SECONDS = 3.0  # no video this long -> show the locked-phone view
-BLACK_SECONDS = 2.0  # only pure-black frames this long -> screen is off -> locked-phone view
+# The locked-phone view follows the phone's own backlight state when it reports one (LeanMirror.backlight).
+# The stream pauses for a few seconds now and then while the phone is in use, so missing video alone
+# isn't "locked":
+WAIT_SECONDS = 10.0  # screen on but no video this long -> "Waiting for your iPhone"
+IDLE_SECONDS = 5.0  # backlight unknown: no video this long -> locked-phone view
+BLACK_SECONDS = 2.0  # backlight unknown: only pure-black frames this long -> screen off -> locked-phone view
 DARK_LEVEL = 14  # average byte value below which a frame counts as "screen off"
 PILL_LEFT = ("home", "switcher", "rotate", "keypad", "settings")
 DEFAULT_SETTINGS = {"size": 0.70, "scroll": 0.45, "pinch_speed": 0.5, "sound": True, "mute_phone": True, "clipboard": True, "stats": False}
@@ -1495,16 +1515,25 @@ def main(
     passcode_swipe_t = 0.0  # when we last swiped up to the passcode screen
     black_since: Optional[float] = None  # when the stream started sending only black frames
     blur_cache: dict[str, Any] = {}
-    stream_stopped = False
+    stream_stopped = False  # no video for a while (wake() restarts it)
+    screen_off = False  # the phone says its screen is off (or only the always-on lock screen shows)
 
     def is_idle(m: Optional[LeanMirror]) -> bool:
-        """Phone locked/asleep: either the video stopped, or it only sends black frames."""
-        nonlocal stream_stopped
+        """Show the locked-phone view? Screen off per the phone, or (if it doesn't say) the video
+        stopped or only sends black frames."""
+        nonlocal stream_stopped, screen_off
         if m is None or "error" in box:
             return False
-        t = time.perf_counter()
-        stream_stopped = t - m.last_feed_t > IDLE_SECONDS
-        return stream_stopped or (black_since is not None and t - black_since > BLACK_SECONDS)
+        quiet = time.perf_counter() - m.last_feed_t
+        if m.backlight is not None:
+            # "activeOn" / "activeDimmed" (idle dimming before auto-lock): in use. "inactiveOn" (always-on
+            # lock screen) / "off": asleep.
+            screen_off = not m.backlight.startswith("active")
+            stream_stopped = quiet > (IDLE_SECONDS if screen_off else WAIT_SECONDS)
+            return screen_off or stream_stopped
+        screen_off = False
+        stream_stopped = quiet > IDLE_SECONDS
+        return stream_stopped or (black_since is not None and time.perf_counter() - black_since > BLACK_SECONDS)
 
     running = True
     while running:
@@ -1906,7 +1935,7 @@ def main(
         got_picture = got_picture or picture is not None
         draw_pill(screen, win_size[0], hover, keypad_on, settings_on)
         if idle and not keypad_on:
-            title = "Waiting for your iPhone" if stream_stopped else "iPhone is locked"
+            title = "Waiting for your iPhone" if stream_stopped and not screen_off else "iPhone is locked"
             draw_locked(screen, y0, disp[0], disp[1], title)
         if keypad_on and picture is not None:
             draw_keypad(screen, y0, disp[0], disp[1])
