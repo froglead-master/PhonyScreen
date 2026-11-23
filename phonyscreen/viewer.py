@@ -43,6 +43,8 @@ from pymobiledevice3.remote.core_device.hid_service import TouchscreenContact
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
 from pymobiledevice3.tunneld.api import get_tunneld_devices
 
+from phonyscreen import phoneclip
+
 logger = logging.getLogger("phonyscreen.viewer")
 
 STALL_SECONDS = 6.0  # no video for this long -> restart the stream
@@ -177,7 +179,12 @@ class LeanMirror(vs.VncStreamServer):
     """pymobiledevice3's stream server with the VNC side replaced by a local window."""
 
     def __init__(self, rsd: Any, target_height: int) -> None:
+        phoneclip.install()  # Gmail/browser copies often carry only HTML inline: read their text from it
         super().__init__(rsd, decoder="av", share_clipboard=True)  # creates the pasteboard monitor
+        if self._clipboard_monitor is not None:
+            # A rich copy whose primary type isn't text/HTML: pull every representation. Can take up
+            # to ~64 s for a Notes copy (pasteboard only, not video); otherwise it never arrives.
+            self._clipboard_monitor._allow_full_pull = True
         self.target_height = target_height
         self.stats = Stats()
         self.last_feed_t = time.perf_counter()
@@ -514,7 +521,8 @@ class LeanMirror(vs.VncStreamServer):
                 await self._clip_pull_evt.wait()
             self._clip_pull_evt.clear()
             try:
-                snapshot, content = await asyncio.wait_for(pb.read_pasteboard(self._rsd), 6.0)
+                # allow_full_pull: see __init__; read_pasteboard bounds that pull at 90 s itself
+                snapshot, content = await asyncio.wait_for(pb.read_pasteboard(self._rsd, allow_full_pull=True), 95.0)
             except asyncio.CancelledError:
                 raise
             except Exception as e:

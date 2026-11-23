@@ -17,6 +17,7 @@ Formerly named PhonePane (old repo froglead-master/PhonePane, renamed 2026-11-23
 - `phonyscreen/viewer.py`: everything else. `LeanMirror` (subclass of pymobiledevice3's `VncStreamServer`) runs the stream on an asyncio thread; `main()` is the pygame window loop (rounded window via SetWindowRgn, pill bar, keypad, settings panel, gestures, locked view)
 - `phonyscreen/audio.py`: AAC-ELD decode (PyAV) + jitter buffer + sounddevice output
 - `phonyscreen/winclip.py`: Win32 clipboard (text)
+- `phonyscreen/phoneclip.py`: text from rich phone copies (HTML / web archive → text), patched into pymobiledevice3's `snapshot_text`
 - `phonyscreen/discovery.py`: finds the phone on Wi-Fi by scanning the /24 for port 62078 and checking the UDID
 - `phonyscreen/config.py`: `%APPDATA%\PhonyScreen\config.json` (udid, wifi_ip, window_pos, settings)
 - `docs/FINDINGS.md`: feasibility research and problems solved. Read before changing streaming code.
@@ -43,10 +44,12 @@ Formerly named PhonePane (old repo froglead-master/PhonePane, renamed 2026-11-23
 - Keep pymobiledevice3 pinned (11.61.1); the app subclasses its internals.
 
 ## Open items (as of 2026-11-23)
-Confirmed working by the owner: scroll scale, wake → auto swipe to passcode screen, keypad, iPhone speaker mute while PC sound plays (HID Mute toggle, `_sync_phone_mute`; captured audio is pre-volume), Home via touchpad pointer drag from the bottom edge.
+Confirmed working by the owner: scroll scale, wake → auto swipe to passcode screen, keypad, iPhone speaker mute while PC sound plays (HID Mute toggle, `_sync_phone_mute`; captured audio is pre-volume), Home via touchpad pointer drag from the bottom edge, Home via one-finger touchscreen swipe from the bottom edge (FingerTracker: lone finger from bottom 5%, up ≥10%, no pause; confirmed 2026-11-23).
 Not working / to verify:
-- **Phone → Windows clipboard still fails** (Windows → phone works). Tried: HWND owner for SetClipboardData, pulling the pasteboard on focus loss and 0.5 s after Ctrl+C/X (`_clip_pull_loop`), plus pymobiledevice3's PasteboardMonitor notifications. Next step: read `%APPDATA%\PhonyScreen\phonyscreen.log` for "phone clipboard changed", "phone copy -> Windows clipboard", "couldn't read the phone clipboard", then test each half in isolation (`pmd3` pasteboard read; `winclip.set_text` alone).
-- Touchscreen Home swipe: added in FingerTracker (lone finger from bottom 5%, up ≥10%, no pause) after the owner reported it didn't work on the touchscreen; untested on hardware.
+Phone → Windows clipboard confirmed on 2026-11-23: plain text field, WhatsApp, Gmail (arrives within ~50 ms; log "phone copy -> Windows clipboard").
+- Rich copies (Gmail/WebKit) list ~8 types in an order that changes per copy. pymobiledevice3 reads only the primary type inline (`promiseSecondary`), so `phoneclip` extracts text from inline HTML or a web archive. For any other primary type, `allow_full_pull` (monitor + `_clip_pull_loop`) pulls every representation: 0.14 s for Gmail, up to ~64 s for Notes-style copies (pasteboard only, not video). An RTF-first copy relies on that full pull; untested.
+- Oddity seen only after a host SET (PC → phone): a PULL can report the new changeCount with the previous contents, or types with empty data. Phone copies were always read correctly.
+- Watchdog back-off never grows: each restart's opening frames update `last_feed_t`, so `_watchdog` resets `backoff` to 5 s and restarts every ~13–20 s while the phone sleeps (each one a "viewed remotely" notification).
 - The owner can't do two-finger touchpad swipes comfortably; the pointer drag and touchscreen paths are what matter.
 Ideas / not done:
 - App Switcher gesture; explore surface 1281 for real system gestures.
