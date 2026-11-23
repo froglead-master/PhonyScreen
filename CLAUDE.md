@@ -29,7 +29,8 @@ Formerly named PhonePane (old repo froglead-master/PhonePane, renamed 2026-11-23
 - Never pause decoding waiting for a keyframe (the base class's refresh loop caused 7 s freezes). On errors: one PLI; if no IDR within 1 s, restart the stream. Watchdog restarts with back-off (5→30 s, counted from any restart), because each restart makes iOS show a "viewed remotely" banner. Every restart opens with a keyframe burst even from an asleep phone, so the back-off resets only when frames still arrive ≥10 s after the last restart (`STEADY_SECONDS`).
 - Locked phone keeps streaming pure black frames → `frame_is_black` → blurred last frame + "Click to wake" (privacy: blur must stay unreadable).
 - Touch: 0..65535 normalized, mainTouchscreen surface (257). Send samples ≥16 ms apart (`_paced_pointer`). iOS does NOT act on injected Home swipes from the bottom edge, so `_track_home_swipe` presses the Home button (Consumer 0x0C/0x40) at the end of such a swipe. Swipe up on the lock screen does work (used to reach the passcode screen after wake).
-- The gesture surface 1281 (19-byte rid 0x13 pointer reports) is unexplored. It might be the route to real system gestures (Home, App Switcher).
+- App Switcher = Home (Consumer 0x0C/0x40) pressed twice, 150 ms apart (`_open_app_switcher`), like a physical Home button. Confirmed on iOS 27.2; no gesture surface needed.
+- The gesture surface 1281 is a Generic Desktop *mouse* (usage 1/2, `_CoreDevice_suppressMousePointer`) taking 19-byte rid 0x13 pointer reports; unexplored. Other surfaces: 512 keyboard, 1026 mainScreenButtons, 1280 avpCustom (vendor page 0xFF61).
 - Audio: RTP PT 101, one raw AAC-ELD frame per packet, 480 samples, 48 kHz stereo. The phone's ASC is wrong for FFmpeg; use `F8 E6 50 00`. The phone keeps playing on its own speaker unless muted; we press its Mute key while PC sound plays (see Open items).
 - Windows clipboard: open it with our HWND or SetClipboardData fails after EmptyClipboard.
 - Dismissed Windows Firewall prompts create Block rules for the exe (tunnel adapter counts as Public network); launcher deletes them.
@@ -44,7 +45,7 @@ Formerly named PhonePane (old repo froglead-master/PhonePane, renamed 2026-11-23
 - Keep pymobiledevice3 pinned (11.61.1); the app subclasses its internals.
 
 ## Open items (as of 2026-11-23)
-Confirmed working by the owner: scroll scale, wake → auto swipe to passcode screen, keypad, iPhone speaker mute while PC sound plays (HID Mute toggle, `_sync_phone_mute`; captured audio is pre-volume), Home via touchpad pointer drag from the bottom edge, Home via one-finger touchscreen swipe from the bottom edge (FingerTracker: lone finger from bottom 5%, up ≥10%, no pause; confirmed 2026-11-23).
+Confirmed working by the owner: scroll scale, wake → auto swipe to passcode screen, keypad, iPhone speaker mute while PC sound plays (HID Mute toggle, `_sync_phone_mute`; captured audio is pre-volume), Home via touchpad pointer drag from the bottom edge, Home via one-finger touchscreen swipe from the bottom edge (FingerTracker: lone finger from bottom 5%, up ≥10%, no pause; confirmed 2026-11-23), App Switcher via pill button, F4 and swipe-up-and-hold from the bottom edge (held still > `HOME_SWIPE_PAUSE` 0.3 s before lifting; confirmed 2026-11-23).
 Not working / to verify:
 Phone → Windows clipboard confirmed on 2026-11-23: plain text field, WhatsApp, Gmail (arrives within ~50 ms; log "phone copy -> Windows clipboard").
 - Rich copies (Gmail/WebKit) list ~8 types in an order that changes per copy. pymobiledevice3 reads only the primary type inline (`promiseSecondary`), so `phoneclip` extracts text from inline HTML or a web archive. For any other primary type, `allow_full_pull` (monitor + `_clip_pull_loop`) pulls every representation: 0.14 s for Gmail, up to ~64 s for Notes-style copies (pasteboard only, not video). An RTF-first copy relies on that full pull; untested.
@@ -52,7 +53,7 @@ Phone → Windows clipboard confirmed on 2026-11-23: plain text field, WhatsApp,
 - Watchdog back-off while the phone sleeps: fixed 2026-11-23 (it used to reset to 5 s on each restart's opening frames, restarting every ~13–20 s). Checked with an offline timing simulation (gaps 10→20→30 s, reset after steady video); not yet on hardware. To verify: let the phone sleep with PhonyScreen open; the log's "restarting stream: no video" lines should space out to 30 s.
 - The owner can't do two-finger touchpad swipes comfortably; the pointer drag and touchscreen paths are what matter.
 Ideas / not done:
-- App Switcher gesture; explore surface 1281 for real system gestures.
+- Explore surface 1281 (mouse) for real system gestures, if ever needed (Home and App Switcher already work via the Home button).
 - Non-ASCII typing (ç, ş, ğ); image clipboard.
 - Multi-touch on touchscreen laptops is untested on hardware.
 - Release v0.1.0 (tag) only after the owner confirms stability; then a download page on froglead.com (repo froglead-master/froglead-website, Vercel). Show him before it goes live.

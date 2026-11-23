@@ -13,10 +13,11 @@ Usually started by the PhonyScreen launcher, which sets up the tunnel first.
 Standalone: needs `pymobiledevice3 remote tunneld` running, or --rsd HOST PORT.
 
 Controls (window focused):
-  click / drag ........ tap / swipe
+  click / drag ........ tap / swipe (up from the bottom edge: Home; up and hold: App Switcher)
   type ................ keyboard input (US-ASCII characters)
   F1 or right-click ... Home          F2 or middle-click ... Lock / wake
-  F3 .................. toggle stats   Esc ................... quit viewer
+  F3 .................. toggle stats   F4 .................... App Switcher
+  Esc ................. quit viewer
 """
 
 from __future__ import annotations
@@ -53,7 +54,9 @@ STEADY_SECONDS = 10.0  # video still arriving this long after a restart -> back-
 TOUCH_INTERVAL = 0.016  # min gap between drag samples sent to the phone (finger-like cadence)
 HOME_SWIPE_EDGE = 0.05  # a drag starting in the bottom 5% of the screen ...
 HOME_SWIPE_DISTANCE = 0.10  # ... and going up at least 10% of it is a Home swipe
+HOME_SWIPE_PAUSE = 0.3  # ... lifted within this of the last move: Home; held still longer first: App Switcher
 HOME_BUTTON = vs._BTN_HOME
+APP_SWITCHER_GAP = 0.15  # Home pressed twice this far apart opens the App Switcher (confirmed on iOS 27.2)
 KEYFRAME_WAIT = 1.0  # after a decode problem, wait this long for a keyframe before restarting
 NEWFRAME = pygame.USEREVENT + 1
 
@@ -310,6 +313,8 @@ class LeanMirror(vs.VncStreamServer):
                     await self._sync_phone_mute()
                 elif ev[0] == "swipe_up":
                     await self._swipe_up_from_bottom(ev[1])
+                elif ev[0] == "app_switcher":
+                    await self._open_app_switcher()
                 elif ev[0] == "clip_to_phone":
                     if self._clipboard_monitor is not None:
                         await self._clipboard_monitor.set_text(ev[1])
@@ -358,10 +363,19 @@ class LeanMirror(vs.VncStreamServer):
         self._touch_last = None
         await asyncio.sleep(0.5)  # let the passcode field appear before digits arrive
 
+    async def _open_app_switcher(self) -> None:
+        """Home pressed twice quickly: iOS opens the App Switcher, as with a physical Home button."""
+        for i in range(2):
+            if i:
+                await asyncio.sleep(APP_SWITCHER_GAP)
+            await self._send_hid_button(*HOME_BUTTON, down=True)
+            await asyncio.sleep(0.05)
+            await self._send_hid_button(*HOME_BUTTON, down=False)
+
     async def _track_home_swipe(self, mask: int, x: int, y: int, was_pressed: bool) -> None:
         """iOS doesn't act on the Home swipe from these injected touches, so recognize it here:
-        a drag that starts at the bottom edge and goes up quickly also presses Home on release.
-        (A drag that pauses before letting go is left alone, like the App Switcher gesture.)"""
+        a drag that starts at the bottom edge and goes up quickly also presses Home on release;
+        one that holds still before letting go opens the App Switcher (iOS's own gesture)."""
         h = max(1, self._fb_height)
         now = time.perf_counter()
         if mask & 1 and not was_pressed:
@@ -377,13 +391,13 @@ class LeanMirror(vs.VncStreamServer):
             return
         self._swipe = None
         start_v, end_v = sw[0], y / h
-        if (
-            was_pressed
-            and start_v >= 1.0 - HOME_SWIPE_EDGE
-            and start_v - end_v >= HOME_SWIPE_DISTANCE
-            and now - sw[2] <= 1.5
-            and now - sw[3] <= 0.3
-        ):
+        if not (was_pressed and start_v >= 1.0 - HOME_SWIPE_EDGE and start_v - end_v >= HOME_SWIPE_DISTANCE):
+            return
+        if now - sw[3] > HOME_SWIPE_PAUSE:
+            logger.info("bottom-edge swipe up and hold -> App Switcher")
+            await asyncio.sleep(0.12)
+            await self._open_app_switcher()
+        elif now - sw[2] <= 1.5:
             logger.info("bottom-edge swipe up -> Home")
             await asyncio.sleep(0.12)
             await self._send_hid_button(*HOME_BUTTON, down=True)
@@ -727,7 +741,7 @@ EDGE_MARGIN = 0.03  # touches starting this close to an edge snap to it (fractio
 IDLE_SECONDS = 3.0  # no video this long -> show the locked-phone view
 BLACK_SECONDS = 2.0  # only pure-black frames this long -> screen is off -> locked-phone view
 DARK_LEVEL = 14  # average byte value below which a frame counts as "screen off"
-PILL_LEFT = ("home", "rotate", "keypad", "settings")
+PILL_LEFT = ("home", "switcher", "rotate", "keypad", "settings")
 DEFAULT_SETTINGS = {"size": 0.70, "scroll": 0.45, "pinch_speed": 0.5, "sound": True, "mute_phone": True, "clipboard": True, "stats": False}
 SETTING_ROWS = (  # (key, label, kind, min, max, step)
     ("size", "Phone size", "pct", 0.35, 0.95, 0.05),
@@ -1027,6 +1041,7 @@ class FingerTracker:
         # lone finger that started on the bottom edge: [finger, start y, picture h, start t, last move t, last y]
         self.solo: Optional[list] = None
         self.home_swipe = False  # set by up() when that finger swiped up: the caller presses Home
+        self.app_switcher = False  # set by up() when it swiped up and held still: the caller opens the App Switcher
 
     def down(self, finger: int, x: int, y: int, w: int, h: int) -> Optional[list[tuple[int, int, int, bool]]]:
         used = {c[0] for c in self.contacts.values()}
@@ -1058,9 +1073,13 @@ class FingerTracker:
         sw, now = self.solo, time.perf_counter()
         if sw and sw[0] == finger:
             self.solo = None
-            # same rule as the mouse: up at least 10% of the screen, quickly, no pause before lifting
-            if (sw[1] - c[2]) / sw[2] >= HOME_SWIPE_DISTANCE and now - sw[3] <= 1.5 and now - sw[4] <= 0.3:
-                self.home_swipe = True
+            # same rule as the mouse: up at least 10% of the screen; held still before lifting =
+            # App Switcher, otherwise (quickly, no pause) = Home
+            if (sw[1] - c[2]) / sw[2] >= HOME_SWIPE_DISTANCE:
+                if now - sw[4] > HOME_SWIPE_PAUSE:
+                    self.app_switcher = True
+                elif now - sw[3] <= 1.5:
+                    self.home_swipe = True
         return self.report() + [(c[0], c[1], c[2], False)]
 
     def report(self) -> list[tuple[int, int, int, bool]]:
@@ -1133,6 +1152,10 @@ def draw_pill(screen: pygame.Surface, win_w: int, hover: Optional[str], keypad_o
     cx, cy = btns["home"].center
     pygame.draw.polygon(screen, fg, [(cx - 7, cy), (cx, cy - 7), (cx + 7, cy)])
     pygame.draw.rect(screen, fg, pygame.Rect(cx - 5, cy, 10, 7))
+    cx, cy = btns["switcher"].center  # App Switcher: two app cards, one behind the other
+    pygame.draw.rect(screen, fg, pygame.Rect(cx - 2, cy - 8, 9, 13), 2, border_radius=2)
+    pygame.draw.rect(screen, (38, 38, 40) if hover != "switcher" else (70, 70, 74), pygame.Rect(cx - 7, cy - 4, 9, 13), border_radius=2)
+    pygame.draw.rect(screen, fg, pygame.Rect(cx - 7, cy - 4, 9, 13), 2, border_radius=2)
     cx, cy = btns["rotate"].center
     pygame.draw.arc(screen, fg, pygame.Rect(cx - 7, cy - 7, 14, 14), 0.6, 5.6, 2)
     pygame.draw.polygon(screen, fg, [(cx + 4, cy - 9), (cx + 9, cy - 3), (cx + 2, cy - 2)])
@@ -1150,7 +1173,7 @@ def draw_pill(screen: pygame.Surface, win_w: int, hover: Optional[str], keypad_o
     cx, cy = btns["close"].center
     pygame.draw.line(screen, fg, (cx - 5, cy - 5), (cx + 5, cy + 5), 2)
     pygame.draw.line(screen, fg, (cx - 5, cy + 5), (cx + 5, cy - 5), 2)
-    gx = (btns["keypad"].right + btns["minimize"].left) // 2  # grip: drag elsewhere on the pill to move
+    gx = (btns[PILL_LEFT[-1]].right + btns["minimize"].left) // 2  # grip: drag elsewhere on the pill to move
     for i in (-1, 0, 1):
         pygame.draw.circle(screen, (120, 120, 126), (gx + i * 7, pr.centery), 2)
 
@@ -1429,6 +1452,8 @@ def main(
                 settings_on = not settings_on
             elif hit == "home" and mirror is not None:
                 mirror.post_input("button", vs._BTN_HOME)
+            elif hit == "switcher" and mirror is not None:
+                mirror.post_input("app_switcher")
             elif hit == "drag":
                 start_window_drag()
 
@@ -1535,6 +1560,10 @@ def main(
                     fingers.home_swipe = False
                     logger.info("touchscreen swipe from the bottom edge -> Home")
                     mirror.post_input("button", HOME_BUTTON)
+                if fingers.app_switcher:
+                    fingers.app_switcher = False
+                    logger.info("touchscreen swipe from the bottom edge and hold -> App Switcher")
+                    mirror.post_input("app_switcher")
             elif ev.type == pygame.KEYDOWN:
                 ctrl = bool(ev.mod & pygame.KMOD_CTRL)
                 if ev.key == pygame.K_ESCAPE:
@@ -1560,6 +1589,8 @@ def main(
                     mirror.post_input("button", vs._BTN_HOME)
                 elif ev.key == pygame.K_F2:
                     mirror.post_input("button", vs._BTN_LOCK)
+                elif ev.key == pygame.K_F4 and not ev.mod & pygame.KMOD_ALT:  # Alt+F4 stays "close"
+                    mirror.post_input("app_switcher")
                 elif ev.key == pygame.K_F3:
                     show_stats = settings["stats"] = not show_stats
                     update_config(settings=settings)
